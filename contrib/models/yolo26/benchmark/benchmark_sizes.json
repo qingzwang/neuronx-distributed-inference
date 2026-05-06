@@ -1,0 +1,152 @@
+{
+  "image": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/assets/bus.jpg",
+  "imgsz": 640,
+  "iters": 30,
+  "warmup": 5,
+  "conf": 0.25,
+  "core_counts": [
+    1,
+    8,
+    32
+  ],
+  "results": {
+    "n": {
+      "weights_size_mb": 5.287602424621582,
+      "cpu": {
+        "model_forward_mean_ms": 47.98340885899961,
+        "model_forward_p50_ms": 47.909858636558056,
+        "num_detections": 5
+      },
+      "compile_fp32": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_fp32.pt",
+        "compile_seconds": null,
+        "cached": true
+      },
+      "neuron_fp32_single": {
+        "model_forward_mean_ms": 17.52234552210818,
+        "model_forward_p50_ms": 17.5141025101766,
+        "num_detections": 5
+      },
+      "neuron_fp32_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 6.556510925292969e-07,
+        "mean_score_delta": 1.7881393432617188e-07,
+        "min_iou": 0.9999991903486444
+      },
+      "compile_fp16": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_fp16.pt",
+        "compile_seconds": null,
+        "cached": true
+      },
+      "neuron_fp16_single": {
+        "model_forward_mean_ms": 32.386802858673036,
+        "model_forward_p50_ms": 32.36916463356465,
+        "num_detections": 5
+      },
+      "neuron_fp16_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 0.0001652240753173828,
+        "mean_score_delta": 9.32455062866211e-05,
+        "min_iou": 0.9994753901329241
+      },
+      "multicore_fp32": [
+        {
+          "num_cores": 1,
+          "batch": 1,
+          "step_mean_ms": 18.347637200107176,
+          "step_p50_ms": 18.345506046898663,
+          "per_image_ms": 18.347637200107176,
+          "throughput_img_per_sec": 54.50293076397644
+        },
+        {
+          "num_cores": 8,
+          "batch": 8,
+          "step_mean_ms": 20.86862341190378,
+          "step_p50_ms": 20.838076947256923,
+          "per_image_ms": 2.6085779264879725,
+          "throughput_img_per_sec": 383.3506332495644
+        },
+        {
+          "num_cores": 32,
+          "batch": 32,
+          "step_mean_ms": 38.70236907775203,
+          "step_p50_ms": 38.61613944172859,
+          "per_image_ms": 1.209449033679751,
+          "throughput_img_per_sec": 826.8227698338789
+        }
+      ],
+      "multicore_dtype": "fp32"
+    },
+    "s": {
+      "weights_size_mb": 19.476628303527832,
+      "cpu": {
+        "model_forward_mean_ms": 54.53183805414786,
+        "model_forward_p50_ms": 54.20332250650972,
+        "num_detections": 5
+      },
+      "compile_fp32": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26s_neuron_fp32.pt",
+        "compile_seconds": null,
+        "cached": true
+      },
+      "neuron_fp32_single": {
+        "model_forward_mean_ms": 13.198699771116177,
+        "model_forward_p50_ms": 13.20119050797075,
+        "num_detections": 5
+      },
+      "neuron_fp32_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 1.1920928955078125e-07,
+        "mean_score_delta": 9.5367431640625e-08,
+        "min_iou": 0.9999996804485647
+      },
+      "compile_fp16": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26s_neuron_fp16.pt",
+        "compile_seconds": null,
+        "cached": true
+      },
+      "neuron_fp16_single": {
+        "model_forward_mean_ms": 16.54297187924385,
+        "model_forward_p50_ms": 16.519589931704104,
+        "num_detections": 5
+      },
+      "neuron_fp16_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 0.0032275915145874023,
+        "mean_score_delta": 0.0007136344909667968,
+        "min_iou": 0.999794026671388
+      },
+      "multicore_fp32": [
+        {
+          "num_cores": 1,
+          "batch": 1,
+          "step_mean_ms": 14.085859541470805,
+          "step_p50_ms": 14.079260407015681,
+          "per_image_ms": 14.085859541470805,
+          "throughput_img_per_sec": 70.99318270609298
+        },
+        {
+          "num_cores": 8,
+          "batch": 8,
+          "step_mean_ms": 16.37834048209091,
+          "step_p50_ms": 16.402203124016523,
+          "per_image_ms": 2.0472925602613636,
+          "throughput_img_per_sec": 488.4499750599088
+        },
+        {
+          "num_cores": 32,
+          "batch": 32,
+          "step_mean_ms": 34.28482866535584,
+          "step_p50_ms": 34.269375493749976,
+          "per_image_ms": 1.07140089579237,
+          "throughput_img_per_sec": 933.35744251029
+        }
+      ],
+      "multicore_dtype": "fp32"
+    }
+  }
+}

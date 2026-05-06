@@ -1,0 +1,359 @@
+{
+  "image": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/assets/bus.jpg",
+  "imgsz": 480,
+  "iters": 30,
+  "warmup": 5,
+  "conf": 0.25,
+  "core_counts": [
+    1,
+    8,
+    32
+  ],
+  "results": {
+    "n": {
+      "weights_size_mb": 5.287602424621582,
+      "cpu": {
+        "model_forward_mean_ms": 38.66427403409034,
+        "model_forward_p50_ms": 38.08195609599352,
+        "num_detections": 6
+      },
+      "compile_fp32": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_fp32_sz480.pt",
+        "compile_seconds": 28.413860609056428,
+        "cached": false
+      },
+      "neuron_fp32_single": {
+        "model_forward_mean_ms": 9.968304044256607,
+        "model_forward_p50_ms": 9.96460800524801,
+        "num_detections": 6
+      },
+      "neuron_fp32_parity": {
+        "cpu_detections": 6,
+        "neuron_detections": 6,
+        "max_score_delta": 6.020069122314453e-06,
+        "mean_score_delta": 2.195437749226888e-06,
+        "min_iou": 0.9999997323678235
+      },
+      "compile_fp16": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_fp16_sz480.pt",
+        "compile_seconds": 23.972224859986454,
+        "cached": false
+      },
+      "neuron_fp16_single": {
+        "model_forward_mean_ms": 18.43918787005047,
+        "model_forward_p50_ms": 18.470498034730554,
+        "num_detections": 6
+      },
+      "neuron_fp16_parity": {
+        "cpu_detections": 6,
+        "neuron_detections": 6,
+        "max_score_delta": 0.004604607820510864,
+        "mean_score_delta": 0.0014380564292271931,
+        "min_iou": 0.9994938695277564
+      },
+      "multicore_fp32": [
+        {
+          "num_cores": 1,
+          "batch": 1,
+          "step_mean_ms": 10.696653804431358,
+          "step_p50_ms": 10.683084023185074,
+          "per_image_ms": 10.696653804431358,
+          "throughput_img_per_sec": 93.48718003622075
+        },
+        {
+          "num_cores": 8,
+          "batch": 8,
+          "step_mean_ms": 12.276131209606925,
+          "step_p50_ms": 12.145783519372344,
+          "per_image_ms": 1.5345164012008656,
+          "throughput_img_per_sec": 651.6711057747123
+        },
+        {
+          "num_cores": 32,
+          "batch": 32,
+          "step_mean_ms": 23.799494211561978,
+          "step_p50_ms": 23.80516892299056,
+          "per_image_ms": 0.7437341941113118,
+          "throughput_img_per_sec": 1344.5663893333563
+        }
+      ],
+      "multicore_dtype": "fp32"
+    },
+    "s": {
+      "weights_size_mb": 19.476628303527832,
+      "cpu": {
+        "model_forward_mean_ms": 46.721232791120805,
+        "model_forward_p50_ms": 46.71714047435671,
+        "num_detections": 5
+      },
+      "compile_fp32": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26s_neuron_fp32_sz480.pt",
+        "compile_seconds": 22.24580264510587,
+        "cached": false
+      },
+      "neuron_fp32_single": {
+        "model_forward_mean_ms": 7.555049277531604,
+        "model_forward_p50_ms": 7.421024143695831,
+        "num_detections": 5
+      },
+      "neuron_fp32_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 4.172325134277344e-07,
+        "mean_score_delta": 1.5497207641601563e-07,
+        "min_iou": 0.9999996818920085
+      },
+      "compile_fp16": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26s_neuron_fp16_sz480.pt",
+        "compile_seconds": 19.008910760981962,
+        "cached": false
+      },
+      "neuron_fp16_single": {
+        "model_forward_mean_ms": 8.977777456554273,
+        "model_forward_p50_ms": 8.973826305009425,
+        "num_detections": 5
+      },
+      "neuron_fp16_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 0.0003898739814758301,
+        "mean_score_delta": 0.0001570582389831543,
+        "min_iou": 0.9995896644047138
+      },
+      "multicore_fp32": [
+        {
+          "num_cores": 1,
+          "batch": 1,
+          "step_mean_ms": 8.016381684380272,
+          "step_p50_ms": 8.010215125977993,
+          "per_image_ms": 8.016381684380272,
+          "throughput_img_per_sec": 124.74455925027573
+        },
+        {
+          "num_cores": 8,
+          "batch": 8,
+          "step_mean_ms": 10.167361904556552,
+          "step_p50_ms": 10.108631919138134,
+          "per_image_ms": 1.270920238069569,
+          "throughput_img_per_sec": 786.8314391774292
+        },
+        {
+          "num_cores": 32,
+          "batch": 32,
+          "step_mean_ms": 17.223703186027706,
+          "step_p50_ms": 17.16822397429496,
+          "per_image_ms": 0.5382407245633658,
+          "throughput_img_per_sec": 1857.9047522114286
+        }
+      ],
+      "multicore_dtype": "fp32"
+    },
+    "m": {
+      "weights_size_mb": 42.20552921295166,
+      "cpu": {
+        "model_forward_mean_ms": 65.44565321722378,
+        "model_forward_p50_ms": 65.93886949121952,
+        "num_detections": 5
+      },
+      "compile_fp32": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26m_neuron_fp32_sz480.pt",
+        "compile_seconds": 27.559795409906656,
+        "cached": false
+      },
+      "neuron_fp32_single": {
+        "model_forward_mean_ms": 9.115195802102486,
+        "model_forward_p50_ms": 9.107834426686168,
+        "num_detections": 5
+      },
+      "neuron_fp32_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 7.152557373046875e-07,
+        "mean_score_delta": 3.457069396972656e-07,
+        "min_iou": 0.9999996244006373
+      },
+      "compile_fp16": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26m_neuron_fp16_sz480.pt",
+        "compile_seconds": 22.399221116909757,
+        "cached": false
+      },
+      "neuron_fp16_single": {
+        "model_forward_mean_ms": 6.934764422476292,
+        "model_forward_p50_ms": 6.933312397450209,
+        "num_detections": 5
+      },
+      "neuron_fp16_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 0.0003711581230163574,
+        "mean_score_delta": 0.00016794204711914062,
+        "min_iou": 0.9996632883027561
+      },
+      "multicore_fp32": [
+        {
+          "num_cores": 1,
+          "batch": 1,
+          "step_mean_ms": 9.871014122230312,
+          "step_p50_ms": 9.880085475742817,
+          "per_image_ms": 9.871014122230312,
+          "throughput_img_per_sec": 101.30671353695261
+        },
+        {
+          "num_cores": 8,
+          "batch": 8,
+          "step_mean_ms": 11.993792241749665,
+          "step_p50_ms": 11.900260928086936,
+          "per_image_ms": 1.499224030218708,
+          "throughput_img_per_sec": 667.0117206259822
+        },
+        {
+          "num_cores": 32,
+          "batch": 32,
+          "step_mean_ms": 19.389799415754776,
+          "step_p50_ms": 19.286462455056608,
+          "per_image_ms": 0.6059312317423368,
+          "throughput_img_per_sec": 1650.3522967854462
+        }
+      ],
+      "multicore_dtype": "fp32"
+    },
+    "l": {
+      "weights_size_mb": 50.74612903594971,
+      "cpu": {
+        "model_forward_mean_ms": 89.69393606142451,
+        "model_forward_p50_ms": 89.23332451377064,
+        "num_detections": 6
+      },
+      "compile_fp32": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26l_neuron_fp32_sz480.pt",
+        "compile_seconds": 38.817231019958854,
+        "cached": false
+      },
+      "neuron_fp32_single": {
+        "model_forward_mean_ms": 12.200548135054609,
+        "model_forward_p50_ms": 12.053775601089,
+        "num_detections": 6
+      },
+      "neuron_fp32_parity": {
+        "cpu_detections": 6,
+        "neuron_detections": 6,
+        "max_score_delta": 5.3375959396362305e-05,
+        "mean_score_delta": 1.0038415590922037e-05,
+        "min_iou": 0.9999997782126361
+      },
+      "compile_fp16": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26l_neuron_fp16_sz480.pt",
+        "compile_seconds": 29.939297352917492,
+        "cached": false
+      },
+      "neuron_fp16_single": {
+        "model_forward_mean_ms": 8.252856569985548,
+        "model_forward_p50_ms": 8.243977441452444,
+        "num_detections": 5
+      },
+      "neuron_fp16_parity": {
+        "cpu_detections": 6,
+        "neuron_detections": 5,
+        "max_score_delta": 0.013696610927581787,
+        "mean_score_delta": 0.00280836820602417,
+        "min_iou": 0.9997014258262431
+      },
+      "multicore_fp32": [
+        {
+          "num_cores": 1,
+          "batch": 1,
+          "step_mean_ms": 12.814541067928076,
+          "step_p50_ms": 12.836180510930717,
+          "per_image_ms": 12.814541067928076,
+          "throughput_img_per_sec": 78.03634907400436
+        },
+        {
+          "num_cores": 8,
+          "batch": 8,
+          "step_mean_ms": 15.54894552876552,
+          "step_p50_ms": 15.651615569368005,
+          "per_image_ms": 1.94361819109569,
+          "throughput_img_per_sec": 514.504342767168
+        },
+        {
+          "num_cores": 32,
+          "batch": 32,
+          "step_mean_ms": 24.181674785601597,
+          "step_p50_ms": 24.340279516763985,
+          "per_image_ms": 0.7556773370500499,
+          "throughput_img_per_sec": 1323.3161178337257
+        }
+      ],
+      "multicore_dtype": "fp32"
+    },
+    "x": {
+      "weights_size_mb": 113.17001819610596,
+      "cpu": {
+        "model_forward_mean_ms": 108.54698152591784,
+        "model_forward_p50_ms": 107.9024673672393,
+        "num_detections": 5
+      },
+      "compile_fp32": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26x_neuron_fp32_sz480.pt",
+        "compile_seconds": 67.73425736185163,
+        "cached": false
+      },
+      "neuron_fp32_single": {
+        "model_forward_mean_ms": 16.621661155174177,
+        "model_forward_p50_ms": 16.542887082323432,
+        "num_detections": 5
+      },
+      "neuron_fp32_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 4.172325134277344e-07,
+        "mean_score_delta": 2.1457672119140626e-07,
+        "min_iou": 0.9999997112356477
+      },
+      "compile_fp16": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26x_neuron_fp16_sz480.pt",
+        "compile_seconds": 48.21265724580735,
+        "cached": false
+      },
+      "neuron_fp16_single": {
+        "model_forward_mean_ms": 9.73196803436925,
+        "model_forward_p50_ms": 9.72276704851538,
+        "num_detections": 5
+      },
+      "neuron_fp16_parity": {
+        "cpu_detections": 5,
+        "neuron_detections": 5,
+        "max_score_delta": 7.43865966796875e-05,
+        "mean_score_delta": 4.034042358398437e-05,
+        "min_iou": 0.9997635391395071
+      },
+      "multicore_fp32": [
+        {
+          "num_cores": 1,
+          "batch": 1,
+          "step_mean_ms": 17.199544173975784,
+          "step_p50_ms": 17.1892074868083,
+          "per_image_ms": 17.199544173975784,
+          "throughput_img_per_sec": 58.14107571019677
+        },
+        {
+          "num_cores": 8,
+          "batch": 8,
+          "step_mean_ms": 19.70509726864596,
+          "step_p50_ms": 19.70179902855307,
+          "per_image_ms": 2.463137158580745,
+          "throughput_img_per_sec": 405.9863237888864
+        },
+        {
+          "num_cores": 32,
+          "batch": 32,
+          "step_mean_ms": 30.013929625662666,
+          "step_p50_ms": 29.94548249989748,
+          "per_image_ms": 0.9379353008019583,
+          "throughput_img_per_sec": 1066.1716209476015
+        }
+      ],
+      "multicore_dtype": "fp32"
+    }
+  }
+}

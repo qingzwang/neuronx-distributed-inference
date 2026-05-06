@@ -1,12 +1,15 @@
 # YOLO26 on AWS Neuron (trn2)
 
-End-to-end object detection with Ultralytics' YOLO26-nano compiled for
+End-to-end object detection with Ultralytics' YOLO26 family compiled for
 trn2 via `torch_neuronx.trace`. Neuron output matches CPU eager-mode on
-the same image to within fp32 rounding noise.
+the same image to within fp32 rounding noise across all 5 size variants.
 
 - Upstream repo: https://github.com/ultralytics/ultralytics
-- Weights: `yolo26n.pt` (nano, 80 COCO classes, 640x640 input)
-- Instance used for benchmarks: `trn2.48xlarge`, single NeuronCore
+- Weights: `yolo26{n,s,m,l,x}.pt` (80 COCO classes)
+- Input size: 640x640 fits `n` and `s`; `m`/`l`/`x` require ≤ ~576x576
+  because the full model doesn't fit in a single NeuronCore's SBUF at 640.
+  The size sweep below uses 480x480 for apples-to-apples comparison.
+- Instance used for benchmarks: `trn2.48xlarge`
 
 ## Layout
 
@@ -18,8 +21,9 @@ yolo26/
     run_cpu.py            # CPU inference + CPU latency benchmark
     compile_neuron.py     # trace + torch_neuronx.compile
     run_neuron.py         # Neuron inference + CPU-parity check + latency
-    benchmark.py          # consolidated CPU-vs-Neuron benchmark
+    benchmark.py          # consolidated CPU-vs-Neuron benchmark (yolo26n)
     benchmark_multicore.py # data-parallel throughput sweep across NeuronCores
+    benchmark_sizes.py    # sweep n/s/m/l/x on CPU + Neuron fp32/fp16 + multi-core
   test/
     test_yolo26.py        # pytest parity check (cpu vs neuron)
   assets/                 # sample images (bus.jpg, zidane.jpg)
@@ -53,50 +57,79 @@ python benchmark.py
 # 5. Sweep throughput across 1/2/4/8/16/32 NeuronCores with DataParallel
 python benchmark_multicore.py
 
-# 6. Unit tests (skip automatically if Neuron / compiled .pt absent)
+# 6. Sweep all five sizes {n,s,m,l,x} on CPU + Neuron fp32/fp16 + multi-core.
+#    640 fits only n/s on trn2; 480 fits all 5.
+python benchmark_sizes.py --imgsz 480                 # full sweep
+python benchmark_sizes.py --sizes n s --imgsz 640     # 640 sweep (n/s only)
+
+# 7. Unit tests (skip automatically if Neuron / compiled .pt absent)
 pytest ../test/test_yolo26.py -v
 ```
 
-## Single-core latency (bus.jpg, 640x640, 50 iters, 5 warmup)
+## Size sweep — single-core latency at 480x480 (bus.jpg, 30 iters)
 
-| path          | model forward mean | end-to-end mean | max score Δ vs CPU | min IoU vs CPU |
-| ------------- | -----------------: | --------------: | -----------------: | -------------: |
-| CPU (x86)     | **54.06 ms**       | 60.25 ms        | —                  | —              |
-| Neuron (fp32) | **17.59 ms**       | 24.16 ms        | 6.6e-7             | 0.9999         |
-| Neuron (fp16) | 32.42 ms           | 39.05 ms        | 1.6e-4             | 0.9993         |
-| Neuron (bf16) | 32.44 ms           | 38.84 ms        | 1.7e-3             | 0.9967         |
+All five variants at the same input resolution, so absolute numbers
+compare directly. Speedup is CPU ÷ Neuron-single-core.
 
-Note: on a model this small (~2.4 M params, 5.4 GFLOPs), `--auto-cast=none`
-(fp32) actually *beats* fp16/bf16 on trn2 because the nano graph is
-compute-light and matmul auto-cast inserts cast ops whose overhead dominates.
-fp16/bf16 are still available for mixing with larger models.
+| variant | weights (MB) | CPU (ms) | Neuron fp32 (ms) | fp32 speedup | Neuron fp16 (ms) | fp16 speedup |
+| ------- | -----------: | -------: | ---------------: | -----------: | ---------------: | -----------: |
+| yolo26n |          5.3 |    38.66 |             9.97 |       3.88×  |            18.44 |       2.10×  |
+| yolo26s |         19.5 |    46.72 |             7.56 |       6.18×  |             8.98 |       5.20×  |
+| yolo26m |         42.2 |    65.45 |             9.12 |       7.18×  |             6.93 |       9.44×  |
+| yolo26l |         50.7 |    89.69 |            12.20 |       7.35×  |             8.25 |      10.87×  |
+| yolo26x |        113.2 |   108.55 |            16.62 |       6.53×  |             9.73 |      11.15×  |
 
-Full per-image tables are in `benchmark/benchmark_report.md`.
+Observations:
+- fp32 is faster than fp16 for **n** (compute-light, cast overhead dominates).
+- From **m** upward fp16 wins — the matmul engine runs at 2× throughput in fp16
+  and the cast overhead becomes amortised.
+- Across 5 variants Neuron gives 3.9× → 11.2× over single-threaded CPU.
 
-### Accuracy vs CPU
+### Accuracy vs CPU (same image, same conf=0.25, 480x480)
 
-```
-bus.jpg    : 5 detections CPU vs 5 Neuron, max score delta 6.6e-07, min IoU 0.9999
-zidane.jpg : 3 detections CPU vs 3 Neuron, max score delta 7.2e-07, min IoU 0.9999
-```
+| variant | cpu dets | fp32 dets | fp32 max Δ | fp32 min IoU | fp16 dets | fp16 max Δ | fp16 min IoU |
+| ------- | -------: | --------: | ---------: | -----------: | --------: | ---------: | -----------: |
+| yolo26n |        6 |         6 |    6.0e-6  |       1.0000 |         6 |     4.6e-3 |       0.9995 |
+| yolo26s |        5 |         5 |    4.2e-7  |       1.0000 |         5 |     3.9e-4 |       0.9996 |
+| yolo26m |        5 |         5 |    7.2e-7  |       1.0000 |         5 |     3.7e-4 |       0.9997 |
+| yolo26l |        6 |         6 |    5.3e-5  |       1.0000 |         5 |     1.4e-2 |       0.9997 |
+| yolo26x |        5 |         5 |    4.2e-7  |       1.0000 |         5 |     7.4e-5 |       0.9998 |
 
-## Multi-core throughput (fp32, `torch_neuronx.DataParallel`, 50 iters, 5 warmup)
+fp32 matches CPU to within 6e-5 across all sizes. fp16 stays within 1.4e-2
+score delta and IoU ≥ 0.9995; yolo26l fp16 drops one low-confidence detection
+(5 vs 6).
+
+## Multi-core throughput (fp32, `torch_neuronx.DataParallel`, 480x480, 30 iters)
 
 Each step feeds one image per NeuronCore (`batch = num_cores`). Per-image
-latency is step wall-clock ÷ batch; `num_workers` is set to `2 * num_cores`
-so the dispatcher does not become the bottleneck.
+latency is step wall-clock ÷ batch; `num_workers` is set to `2 × num_cores`
+so the dispatcher isn't the bottleneck.
 
-| cores | batch | per-image (ms) | throughput (img/s) | scaling |
-|------:|------:|---------------:|-------------------:|--------:|
-| 1     | 1     | 18.38          | 54.4               | 1.00x   |
-| 2     | 2     |  9.54          | 104.9              | 1.93x   |
-| 4     | 4     |  4.95          | 202.2              | 3.72x   |
-| 8     | 8     |  2.69          | 372.1              | 6.84x   |
-| 16    | 16    |  1.74          | 573.6              | 10.55x  |
-| 32    | 32    |  1.12          | 889.6              | 16.35x  |
+| variant | 1 core (img/s) | 8 cores (img/s) | 32 cores (img/s) | 32-core per-image (ms) |
+| ------- | -------------: | --------------: | ---------------: | ---------------------: |
+| yolo26n |           93.5 |           651.7 |           1344.6 |                   0.74 |
+| yolo26s |          124.7 |           786.8 |           1857.9 |                   0.54 |
+| yolo26m |          101.3 |           667.0 |           1650.4 |                   0.61 |
+| yolo26l |           78.0 |           514.5 |           1323.3 |                   0.76 |
+| yolo26x |           58.1 |           406.0 |           1066.2 |                   0.94 |
 
-Raw JSON / markdown outputs live in `benchmark/benchmark_multicore*.{json,md}`
-for each dtype (fp32 is the default artifact).
+yolo26**s** is the throughput sweet spot at 480x480 (1858 img/s across 32
+cores, 0.54 ms/image).
+
+## 640x640 (yolo26n/s only — larger models don't fit)
+
+At 640x640 the full model + activations exceed the SBUF on one NeuronCore
+for m/l/x and the compiler bails with `NCC_IGCA030`. For n and s at 640:
+
+| variant | CPU (ms) | Neuron fp32 (ms) | fp32 speedup | Neuron fp16 (ms) | 32-core throughput (img/s) |
+| ------- | -------: | ---------------: | -----------: | ---------------: | -------------------------: |
+| yolo26n |    47.98 |            17.52 |        2.74× |            32.39 |                      826.8 |
+| yolo26s |    54.53 |            13.20 |        4.13× |            16.54 |                      933.4 |
+
+For the larger models at 640, options are: (a) reduce `--imgsz` to ≤ ~576,
+(b) shard with tensor parallelism over multiple NeuronCores via `neuronx_distributed`.
+
+Raw JSON / markdown outputs per resolution and dtype live in `benchmark/`.
 
 ## Why the monkey-patch?
 
@@ -119,10 +152,11 @@ matches CPU to within 1e-6.
 
 ## Limitations
 
-- Only YOLO26-nano is wired in; other sizes need a fresh trace.
-- Batch size is fixed to 1 at compile time (change via `--imgsz` etc.
-  and recompile).
-- LNC=1 is used so the graph fits on a single NeuronCore; no tensor
-  parallelism is needed for this model size.
-- The top-k step (~0.5 ms) runs on CPU. If you need fully on-device
-  postprocessing, replace it with a custom NKI top-k kernel.
+- Batch size is fixed to 1 at compile time. `benchmark_multicore.py` scales
+  throughput by running one NEFF per NeuronCore in parallel — change batch
+  by recompiling with a different example tensor.
+- LNC=1 means each traced graph fits on a single NeuronCore. This works up
+  through yolo26x at ≤480×480. For 640×640 m/l/x, either drop resolution or
+  shard with tensor parallelism via `neuronx_distributed`.
+- The top-k step (≈0.5 ms) runs on CPU. A custom NKI top-k kernel would
+  make the whole pipeline on-device.

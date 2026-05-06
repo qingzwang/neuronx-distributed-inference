@@ -1,5 +1,5 @@
 # Pretrained weights (re-downloaded by ultralytics on first use)
-yolo26n.pt
+yolo26*.pt
 
 # Neuron-compiled artifacts (produced by compile_neuron.py)
 compiled/*.pt
