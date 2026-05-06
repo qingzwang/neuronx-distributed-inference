@@ -1,0 +1,64 @@
+{
+  "device": "neuron",
+  "weights": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/yolo26n.pt",
+  "compiled": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_fp32.pt",
+  "image": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/assets/bus.jpg",
+  "imgsz": 640,
+  "iters": 50,
+  "warmup": 5,
+  "model_forward_mean_ms": 17.582569820806384,
+  "model_forward_p50_ms": 17.58721750229597,
+  "end_to_end_mean_ms": 24.117795499041677,
+  "end_to_end_p50_ms": 24.11076007410884,
+  "num_detections": 5,
+  "detections": [
+    [
+      5.575604438781738,
+      228.86618041992188,
+      807.2330932617188,
+      749.2353515625,
+      0.9253456592559814,
+      5
+    ],
+    [
+      46.56531524658203,
+      398.74884033203125,
+      236.98782348632812,
+      901.7470092773438,
+      0.9151439070701599,
+      0
+    ],
+    [
+      223.06321716308594,
+      405.2968444824219,
+      345.186279296875,
+      863.1107788085938,
+      0.8991414308547974,
+      0
+    ],
+    [
+      668.6156005859375,
+      391.23126220703125,
+      809.0,
+      879.6685180664062,
+      0.8602309226989746,
+      0
+    ],
+    [
+      0.0,
+      553.8179931640625,
+      64.8377914428711,
+      874.0271606445312,
+      0.5252568125724792,
+      0
+    ]
+  ],
+  "accuracy_vs_cpu": {
+    "cpu_detections": 5,
+    "neuron_detections": 5,
+    "matched": 5,
+    "max_score_delta": 6.556510925292969e-07,
+    "mean_score_delta": 1.7881393432617188e-07,
+    "min_iou_among_matches": 0.9999993443489075
+  }
+}

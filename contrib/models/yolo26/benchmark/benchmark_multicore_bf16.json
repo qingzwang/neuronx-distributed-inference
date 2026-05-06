@@ -1,0 +1,133 @@
+{
+  "model": "yolo26n",
+  "imgsz": 640,
+  "iters": 50,
+  "warmup": 5,
+  "compiled": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_bf16.pt",
+  "instance": "trn2.48xlarge",
+  "rows": [
+    {
+      "num_cores": 1,
+      "device_ids": [
+        "nc:0"
+      ],
+      "batch_size": 1,
+      "batch_mean_ms": 33.25116536580026,
+      "batch_p50_ms": 33.250809530727565,
+      "per_image_ms": 33.25116536580026,
+      "throughput_img_per_sec": 30.074133913770357
+    },
+    {
+      "num_cores": 2,
+      "device_ids": [
+        "nc:0",
+        "nc:1"
+      ],
+      "batch_size": 2,
+      "batch_mean_ms": 33.746593915857375,
+      "batch_p50_ms": 33.699450083076954,
+      "per_image_ms": 16.873296957928687,
+      "throughput_img_per_sec": 59.265240367271815
+    },
+    {
+      "num_cores": 4,
+      "device_ids": [
+        "nc:0",
+        "nc:1",
+        "nc:2",
+        "nc:3"
+      ],
+      "batch_size": 4,
+      "batch_mean_ms": 34.61657959036529,
+      "batch_p50_ms": 34.63618899695575,
+      "per_image_ms": 8.654144897591323,
+      "throughput_img_per_sec": 115.55156654221567
+    },
+    {
+      "num_cores": 8,
+      "device_ids": [
+        "nc:0",
+        "nc:1",
+        "nc:2",
+        "nc:3",
+        "nc:4",
+        "nc:5",
+        "nc:6",
+        "nc:7"
+      ],
+      "batch_size": 8,
+      "batch_mean_ms": 35.563303916715086,
+      "batch_p50_ms": 35.45050846878439,
+      "per_image_ms": 4.445412989589386,
+      "throughput_img_per_sec": 224.95097808502337
+    },
+    {
+      "num_cores": 16,
+      "device_ids": [
+        "nc:0",
+        "nc:1",
+        "nc:2",
+        "nc:3",
+        "nc:4",
+        "nc:5",
+        "nc:6",
+        "nc:7",
+        "nc:8",
+        "nc:9",
+        "nc:10",
+        "nc:11",
+        "nc:12",
+        "nc:13",
+        "nc:14",
+        "nc:15"
+      ],
+      "batch_size": 16,
+      "batch_mean_ms": 42.72212401032448,
+      "batch_p50_ms": 42.69944201223552,
+      "per_image_ms": 2.67013275064528,
+      "throughput_img_per_sec": 374.5132146550894
+    },
+    {
+      "num_cores": 32,
+      "device_ids": [
+        "nc:0",
+        "nc:1",
+        "nc:2",
+        "nc:3",
+        "nc:4",
+        "nc:5",
+        "nc:6",
+        "nc:7",
+        "nc:8",
+        "nc:9",
+        "nc:10",
+        "nc:11",
+        "nc:12",
+        "nc:13",
+        "nc:14",
+        "nc:15",
+        "nc:16",
+        "nc:17",
+        "nc:18",
+        "nc:19",
+        "nc:20",
+        "nc:21",
+        "nc:22",
+        "nc:23",
+        "nc:24",
+        "nc:25",
+        "nc:26",
+        "nc:27",
+        "nc:28",
+        "nc:29",
+        "nc:30",
+        "nc:31"
+      ],
+      "batch_size": 32,
+      "batch_mean_ms": 49.44107111543417,
+      "batch_p50_ms": 49.28714851848781,
+      "per_image_ms": 1.5450334723573178,
+      "throughput_img_per_sec": 647.2351686169368
+    }
+  ]
+}

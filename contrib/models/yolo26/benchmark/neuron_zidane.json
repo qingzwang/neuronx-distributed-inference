@@ -1,0 +1,48 @@
+{
+  "device": "neuron",
+  "weights": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/yolo26n.pt",
+  "compiled": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_fp32.pt",
+  "image": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/assets/zidane.jpg",
+  "imgsz": 640,
+  "iters": 50,
+  "warmup": 5,
+  "model_forward_mean_ms": 17.524385936558247,
+  "model_forward_p50_ms": 17.52171595580876,
+  "end_to_end_mean_ms": 22.91899626608938,
+  "end_to_end_p50_ms": 22.931758081540465,
+  "num_detections": 3,
+  "detections": [
+    [
+      745.1774291992188,
+      40.25872802734375,
+      1149.8623046875,
+      710.648193359375,
+      0.9184519648551941,
+      0
+    ],
+    [
+      119.89199829101562,
+      201.81594848632812,
+      987.4138793945312,
+      713.46630859375,
+      0.903023362159729,
+      0
+    ],
+    [
+      433.5760192871094,
+      430.673095703125,
+      525.4970092773438,
+      714.78662109375,
+      0.529721200466156,
+      27
+    ]
+  ],
+  "accuracy_vs_cpu": {
+    "cpu_detections": 3,
+    "neuron_detections": 3,
+    "matched": 3,
+    "max_score_delta": 7.152557373046875e-07,
+    "mean_score_delta": 4.172325134277344e-07,
+    "min_iou_among_matches": 0.9999994039535522
+  }
+}

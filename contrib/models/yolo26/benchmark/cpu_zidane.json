@@ -1,0 +1,39 @@
+{
+  "device": "cpu",
+  "weights": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/yolo26n.pt",
+  "image": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/assets/zidane.jpg",
+  "imgsz": 640,
+  "iters": 20,
+  "warmup": 3,
+  "model_forward_mean_ms": 54.57033850252628,
+  "model_forward_p50_ms": 54.54812408424914,
+  "end_to_end_mean_ms": 56.064098281785846,
+  "end_to_end_p50_ms": 54.97119657229632,
+  "num_detections": 3,
+  "detections": [
+    [
+      745.177490234375,
+      40.25872802734375,
+      1149.8623046875,
+      710.648193359375,
+      0.9184514880180359,
+      0
+    ],
+    [
+      119.89193725585938,
+      201.81588745117188,
+      987.4139404296875,
+      713.46630859375,
+      0.9030234217643738,
+      0
+    ],
+    [
+      433.57598876953125,
+      430.673095703125,
+      525.4970092773438,
+      714.7866821289062,
+      0.5297219157218933,
+      27
+    ]
+  ]
+}

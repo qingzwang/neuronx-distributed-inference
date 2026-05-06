@@ -1,0 +1,14 @@
+# Pretrained weights (re-downloaded by ultralytics on first use)
+yolo26n.pt
+
+# Neuron-compiled artifacts (produced by compile_neuron.py)
+compiled/*.pt
+
+# Python / pytest caches
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Neuron compiler logs
+log-neuron-cc.txt
+global_metric_store.json
