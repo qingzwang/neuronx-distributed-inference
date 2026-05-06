@@ -1,0 +1,87 @@
+{
+  "env": {
+    "torch": "2.9.1+cu128",
+    "torch_neuronx": "2.9.0.2.13.24727+8e870898",
+    "cpu_model": "Intel(R) Xeon(R) Platinum 8488C",
+    "cpu_count": 96,
+    "instance": "ip-172-31-21-9",
+    "date": "2026-05-05 16:31:55 UTC"
+  },
+  "results": [
+    {
+      "resolution": 1024,
+      "tile": 128,
+      "scale": 4,
+      "n_tiles": 64,
+      "neuron": {
+        "iters": 2,
+        "total_ms_median": 12812.606186023913,
+        "total_ms_mean": 12812.606186023913,
+        "total_ms_min": 12804.239602060989,
+        "total_ms_max": 12820.972769986838,
+        "per_tile_ms_median": 199.49089747387916,
+        "per_tile_ms_mean": 199.51979004508757
+      },
+      "cpu": {
+        "sampled_tiles": 8,
+        "sample_total_ms": 3195.289612049237,
+        "total_ms_extrapolated": 22076.835714280605,
+        "per_tile_ms_median": 344.95055803563446,
+        "per_tile_ms_mean": 399.38518838607706,
+        "per_tile_ms_min": 337.5795290339738,
+        "per_tile_ms_max": 764.7355839144439
+      },
+      "speedup_cpu_over_neuron": 1.7230558243772593
+    },
+    {
+      "resolution": 2048,
+      "tile": 128,
+      "scale": 4,
+      "n_tiles": 256,
+      "neuron": {
+        "iters": 2,
+        "total_ms_median": 51233.25257690158,
+        "total_ms_mean": 51233.25257690158,
+        "total_ms_min": 51199.835219886154,
+        "total_ms_max": 51266.669933917,
+        "per_tile_ms_median": 199.47458407841623,
+        "per_tile_ms_mean": 199.48000512749786
+      },
+      "cpu": {
+        "sampled_tiles": 8,
+        "sample_total_ms": 3196.6574168764055,
+        "total_ms_extrapolated": 103968.93632411957,
+        "per_tile_ms_median": 406.12865751609206,
+        "per_tile_ms_mean": 399.55553790787235,
+        "per_tile_ms_min": 377.04892503097653,
+        "per_tile_ms_max": 411.2264041323215
+      },
+      "speedup_cpu_over_neuron": 2.029325313048615
+    },
+    {
+      "resolution": 4096,
+      "tile": 128,
+      "scale": 4,
+      "n_tiles": 1024,
+      "neuron": {
+        "iters": 2,
+        "total_ms_median": 204850.67957290448,
+        "total_ms_mean": 204850.67957290448,
+        "total_ms_min": 204797.58430086076,
+        "total_ms_max": 204903.7748449482,
+        "per_tile_ms_median": 199.4224941590801,
+        "per_tile_ms_mean": 199.43413006171795
+      },
+      "cpu": {
+        "sampled_tiles": 8,
+        "sample_total_ms": 3586.3170698285103,
+        "total_ms_extrapolated": 417914.5692586899,
+        "per_tile_ms_median": 408.11969654168934,
+        "per_tile_ms_mean": 448.2608784455806,
+        "per_tile_ms_min": 403.9276968687773,
+        "per_tile_ms_max": 731.5787579864264
+      },
+      "speedup_cpu_over_neuron": 2.040093643477311
+    }
+  ]
+}
