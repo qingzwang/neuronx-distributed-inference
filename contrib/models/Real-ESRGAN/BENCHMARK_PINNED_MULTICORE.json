@@ -1,0 +1,75 @@
+{
+  "env": {
+    "torch": "2.9.1+cu128",
+    "torch_neuronx": "2.9.0.2.13.24727+8e870898",
+    "date": "2026-05-08 08:54:06 UTC"
+  },
+  "results": [
+    {
+      "n_cores": 1,
+      "n_tiles": 64,
+      "iters": 3,
+      "total_ms_median": 3071.8650789931417,
+      "total_ms_mean": 3071.8176579878977,
+      "total_ms_min": 3071.550379972905,
+      "total_ms_max": 3072.037514997646,
+      "ms_per_tile": 47.99789185926784,
+      "throughput_images_per_s": 20.834248365158388
+    },
+    {
+      "n_cores": 2,
+      "n_tiles": 64,
+      "iters": 3,
+      "total_ms_median": 1549.8968979809433,
+      "total_ms_mean": 1549.9805487537135,
+      "total_ms_min": 1549.5620761066675,
+      "total_ms_max": 1550.4826721735299,
+      "ms_per_tile": 24.21713903095224,
+      "throughput_images_per_s": 41.29306928955923
+    },
+    {
+      "n_cores": 4,
+      "n_tiles": 64,
+      "iters": 3,
+      "total_ms_median": 780.7616961654276,
+      "total_ms_mean": 780.5275903083384,
+      "total_ms_min": 780.0399519037455,
+      "total_ms_max": 780.7811228558421,
+      "ms_per_tile": 12.199401502584806,
+      "throughput_images_per_s": 81.97123439113962
+    },
+    {
+      "n_cores": 8,
+      "n_tiles": 64,
+      "iters": 3,
+      "total_ms_median": 394.81988991610706,
+      "total_ms_mean": 394.80615267530084,
+      "total_ms_min": 394.65576712973416,
+      "total_ms_max": 394.9428009800613,
+      "ms_per_tile": 6.169060779939173,
+      "throughput_images_per_s": 162.09922963505963
+    },
+    {
+      "n_cores": 16,
+      "n_tiles": 64,
+      "iters": 3,
+      "total_ms_median": 202.01067416928709,
+      "total_ms_mean": 202.0935098019739,
+      "total_ms_min": 201.95217011496425,
+      "total_ms_max": 202.31768512167037,
+      "ms_per_tile": 3.1564167838951107,
+      "throughput_images_per_s": 316.8149418993935
+    },
+    {
+      "n_cores": 32,
+      "n_tiles": 64,
+      "iters": 3,
+      "total_ms_median": 106.85737105086446,
+      "total_ms_mean": 106.95845012863477,
+      "total_ms_min": 106.66074021719396,
+      "total_ms_max": 107.3572391178459,
+      "ms_per_tile": 1.6696464226697572,
+      "throughput_images_per_s": 598.9292022684685
+    }
+  ]
+}
