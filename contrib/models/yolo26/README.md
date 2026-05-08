@@ -30,6 +30,10 @@ yolo26/
     benchmark_aligned.py  # peak-throughput aligned with AWS Neuron reference table
   test/
     test_yolo26.py        # pytest parity check (cpu vs neuron)
+  reproduce_jimburtoft/   # verbatim copy of the upstream contrib + notebook
+    modeling_yolo26.py    # unmodified from jimburtoft/neuronx-distributed-inference
+    yolo26_neuron_notebook.ipynb
+    run_bench.py          # script form of the notebook's DP=8 benchmark
   assets/                 # sample images (bus.jpg, zidane.jpg)
   compiled/               # saved .pt traced modules
   benchmark/              # JSON + markdown benchmark outputs
@@ -138,17 +142,61 @@ fit.
 | yolo26l |         449 img/s |      1 093 img/s | −59% |
 | yolo26x |         380 img/s |        876 img/s | −57% |
 
-Parameter counts, dtype, and BS/core are identical to the reference. The
-throughput gap for the bigger variants is real — likely attributable to
-differences in `torch_neuronx.DataParallel` implementation between SDK
-versions and/or instance type (trn2.3xlarge is a 1-chip, 8-core form
-factor; trn2.48xlarge is 16 chips). The NEFF sizes are in the same
-ballpark (ours slightly larger for m/s; smaller for x).
+Parameter counts, dtype, and BS/core are identical to the reference. My
+SDK is `2.29.1` (one point release *newer* than the reference's 2.28/2.29),
+so version isn't what's causing the remaining gap — it's the instance
+form factor. See the next section for a verbatim reproduction of the
+upstream notebook.
 
-This benchmark uses **explicit per-core NEFF placement via
-`torch_neuronx.neuron_cores_context`** with a thread pool. With plain
-`torch_neuronx.DataParallel(device_ids=...)` the scaling past ~2 cores
-collapses (tested: s BS=32 DP=8 drops from ~540 img/s to ~160 img/s).
+### Running the upstream notebook verbatim
+
+`reproduce_jimburtoft/` contains the original
+[`yolo26_neuron_notebook.ipynb`](https://github.com/jimburtoft/neuronx-distributed-inference/tree/contrib/yolo26/contrib/models/YOLO26)
+and its `modeling_yolo26.py` copied unchanged. Executed end-to-end on
+our `trn2.48xlarge` with `NEURON_LOGICAL_NC_CONFIG=1`:
+
+| variant | dtype | BS/core | my trn2.48xlarge | ref trn2.3xlarge | ratio |
+|---------|-------|--------:|-----------------:|-----------------:|------:|
+| yolo26n | fp32  |  1 |   67.9 img/s |   272 img/s | 0.25× |
+| yolo26s | fp32  | 32 |  227.0 img/s | 1 523 img/s | 0.15× |
+| yolo26m | bf16  | 32 |  281.9 img/s | 1 267 img/s | 0.22× |
+| yolo26l | bf16  | 32 |  249.5 img/s | 1 093 img/s | 0.20× |
+| yolo26x | bf16  | 16 |  203.4 img/s |   876 img/s | 0.23× |
+
+Accuracy matches (CosSim ≥ 0.988 across all variants, same numbers the
+upstream README reports). Throughput is 4–7× lower than the reference.
+Same code, same dtype, same BS — so neither source modifications nor
+dtype handling explains it.
+
+**Where the gap comes from — single core vs multi-core.** Single-core
+latency already runs ~2× slower than the reference's implied per-core
+share: `yolo26s` single-core is 14.1 ms/image here vs 5.3 ms/image on
+trn2.3xlarge (= 1523 img/s ÷ 8 cores). And then `DataParallel` leaves
+another ~2.5× on the table for 8-way scaling (see below).
+
+### Why my top-level numbers are higher than the upstream notebook
+
+Same NEFF (`yolo26s_fp32_bs32`), same DP=8, same warmup/iters, **only the
+dispatch path changes**:
+
+| dispatch               | step (ms) | throughput  | vs upstream |
+| ---------------------- | --------: | ----------: | ----------: |
+| A. `DataParallel` defaults (`num_workers=2`, what the upstream notebook uses) |    1 118 |   229 img/s | 1.00× |
+| B. `DataParallel` with `num_workers = 2 × DP` |      456 |   562 img/s | 2.45× |
+| C. Explicit per-core NEFF placement via `neuron_cores_context` + `ThreadPoolExecutor` |      384 |   666 img/s | 2.91× |
+
+Two dispatcher bottlenecks stack on top of each other:
+1. `torch_neuronx.DataParallel` defaults to `num_workers=2`, so all 8 cores
+   get fed through a 2-thread pool — the 7th core is waiting for a thread
+   long before its predecessor finishes. Bumping the workers to `2 × DP`
+   removes that serialisation (→ 562 img/s, +145%).
+2. Even then, `DataParallel`'s scatter still has overhead. Loading one
+   NEFF replica per core explicitly and dispatching with a plain
+   `ThreadPoolExecutor` is another +18% on top (→ 666 img/s).
+
+`benchmark_aligned.py` and `benchmark_multicore.py` both use route C.
+`benchmark_sizes.py` does the same. If you run `reproduce_jimburtoft/`
+you get route A and see numbers that match the upstream notebook.
 
 ## Multi-core throughput (fp32, `torch_neuronx.DataParallel`, 480x480, 30 iters)
 

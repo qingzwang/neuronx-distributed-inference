@@ -1,0 +1,31 @@
+{
+  "purpose": "Isolate why the reproduced yolo26s DP=8 throughput (227 img/s) is far below the reference 1523 img/s. Same NEFF, same batch, only the dispatch path varies.",
+  "neff": "yolo26s_fp32_bs32_lnc1.pt",
+  "dp": 8,
+  "batch_per_core": 32,
+  "iters": 30,
+  "warmup": 5,
+  "instance": "trn2.48xlarge",
+  "lnc": 1,
+  "results": [
+    {
+      "name": "A. DataParallel default (num_workers=2, upstream-notebook path)",
+      "step_mean_ms": 1118.3,
+      "throughput_img_per_sec": 229,
+      "speedup_vs_A": 1.0
+    },
+    {
+      "name": "B. DataParallel num_workers=16 (2 * DP)",
+      "step_mean_ms": 455.6,
+      "throughput_img_per_sec": 562,
+      "speedup_vs_A": 2.45
+    },
+    {
+      "name": "C. Explicit per-core placement via neuron_cores_context + ThreadPoolExecutor",
+      "step_mean_ms": 384.4,
+      "throughput_img_per_sec": 666,
+      "speedup_vs_A": 2.91
+    }
+  ],
+  "conclusion": "Upstream notebook leaves ~2.5x on the table by accepting torch_neuronx.DataParallel's default num_workers=2, which serialises 8 cores through a 2-thread pool. Explicit placement + ThreadPool gives another +18% on top."
+}
