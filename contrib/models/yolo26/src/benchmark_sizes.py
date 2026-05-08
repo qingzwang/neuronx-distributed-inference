@@ -172,22 +172,34 @@ def _multicore(
     warmup: int,
     imgsz: int,
 ) -> List[dict]:
-    # Build a tensor once; batch is num_cores, same image replicated.
+    """Place one NEFF per core and dispatch with a thread pool.
+
+    See `benchmark_multicore.bench` for why this beats `DataParallel` on
+    shallow models — explicit per-core placement is the key.
+    """
+    from concurrent.futures import ThreadPoolExecutor
     base_t, _, _ = preprocess_image(str(image), imgsz=imgsz)
     rows = []
     for n in core_counts:
-        mod = torch.jit.load(str(compiled_path))
-        device_ids = [f"nc:{i}" for i in range(n)]
-        runner = torch_neuronx.DataParallel(mod, device_ids=device_ids)
-        runner.num_workers = max(2 * n, 4)
+        modules = []
+        for i in range(n):
+            with torch_neuronx.experimental.placement.neuron_cores_context(
+                start_nc=i, nc_count=1,
+            ):
+                modules.append(torch.jit.load(str(compiled_path)))
+        pool = ThreadPoolExecutor(max_workers=max(2 * n, 4))
 
-        batch = base_t.repeat(n, 1, 1, 1).contiguous()
+        def step():
+            futs = [pool.submit(m, base_t) for m in modules]
+            for f in futs:
+                f.result()
+
         for _ in range(warmup):
-            _ = runner(batch)
+            step()
         timings = []
         for _ in range(iters):
             t0 = time.perf_counter()
-            _ = runner(batch)
+            step()
             timings.append((time.perf_counter() - t0) * 1000.0)
         arr = np.asarray(timings)
         step_mean = float(arr.mean())

@@ -1,0 +1,137 @@
+{
+  "imgsz": 640,
+  "dp": 8,
+  "iters": 30,
+  "warmup": 5,
+  "instance": "trn2.48xlarge",
+  "lnc": 1,
+  "reference_specs": [
+    {
+      "size": "n",
+      "dtype": "fp32",
+      "batch_per_core": 1
+    },
+    {
+      "size": "s",
+      "dtype": "fp32",
+      "batch_per_core": 32
+    },
+    {
+      "size": "m",
+      "dtype": "bf16",
+      "batch_per_core": 32
+    },
+    {
+      "size": "l",
+      "dtype": "bf16",
+      "batch_per_core": 32
+    },
+    {
+      "size": "x",
+      "dtype": "bf16",
+      "batch_per_core": 16
+    }
+  ],
+  "results": {
+    "n": {
+      "dtype": "fp32",
+      "batch_per_core": 1,
+      "pre_fuse_params": 2572280,
+      "compile": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26n_neuron_fp32_bs1_sz640.pt",
+        "compile_seconds": null,
+        "cached": true,
+        "neff_size_mb": 10.247969627380371
+      },
+      "throughput": {
+        "dp": 8,
+        "batch_per_core": 1,
+        "images_per_step": 8,
+        "step_mean_ms": 19.073192806293566,
+        "step_p50_ms": 19.05574311967939,
+        "per_image_ms": 2.3841491007866957,
+        "throughput_img_per_sec": 419.4368547126649
+      }
+    },
+    "s": {
+      "dtype": "fp32",
+      "batch_per_core": 32,
+      "pre_fuse_params": 10009784,
+      "compile": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26s_neuron_fp32_bs32_sz640.pt",
+        "compile_seconds": null,
+        "cached": true,
+        "neff_size_mb": 75.71847915649414
+      },
+      "throughput": {
+        "dp": 8,
+        "batch_per_core": 32,
+        "images_per_step": 256,
+        "step_mean_ms": 474.55956243599456,
+        "step_p50_ms": 475.7067320169881,
+        "per_image_ms": 1.8537482907656038,
+        "throughput_img_per_sec": 539.4475641496057
+      }
+    },
+    "m": {
+      "dtype": "bf16",
+      "batch_per_core": 32,
+      "pre_fuse_params": 21896248,
+      "compile": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26m_neuron_bf16_bs32_sz640.pt",
+        "compile_seconds": 464.4226768859662,
+        "cached": false,
+        "neff_size_mb": 78.94781112670898
+      },
+      "throughput": {
+        "dp": 8,
+        "batch_per_core": 32,
+        "images_per_step": 256,
+        "step_mean_ms": 519.7949604674553,
+        "step_p50_ms": 517.604110063985,
+        "per_image_ms": 2.0304490643259974,
+        "throughput_img_per_sec": 492.50188914832376
+      }
+    },
+    "l": {
+      "dtype": "bf16",
+      "batch_per_core": 32,
+      "pre_fuse_params": 26299704,
+      "compile": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26l_neuron_bf16_bs32_sz640.pt",
+        "compile_seconds": 578.6528680860065,
+        "cached": false,
+        "neff_size_mb": 97.44021987915039
+      },
+      "throughput": {
+        "dp": 8,
+        "batch_per_core": 32,
+        "images_per_step": 256,
+        "step_mean_ms": 570.7388811279088,
+        "step_p50_ms": 573.1984809972346,
+        "per_image_ms": 2.229448754405894,
+        "throughput_img_per_sec": 448.5413706073191
+      }
+    },
+    "x": {
+      "dtype": "bf16",
+      "batch_per_core": 16,
+      "pre_fuse_params": 58993368,
+      "compile": {
+        "path": "/home/ubuntu/qwen-omini-on-trn/neuronx-distributed-inference/contrib/models/yolo26/compiled/yolo26x_neuron_bf16_bs16_sz640.pt",
+        "compile_seconds": 444.47395762009546,
+        "cached": false,
+        "neff_size_mb": 127.50858306884766
+      },
+      "throughput": {
+        "dp": 8,
+        "batch_per_core": 16,
+        "images_per_step": 128,
+        "step_mean_ms": 336.71157920422655,
+        "step_p50_ms": 336.39234700240195,
+        "per_image_ms": 2.63055921253302,
+        "throughput_img_per_sec": 380.1473067915013
+      }
+    }
+  }
+}

@@ -59,6 +59,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", default=str(WEIGHTS_PATH))
     parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
+    parser.add_argument("--batch-size", type=int, default=1, help="static batch size baked into the NEFF")
     parser.add_argument("--out", default=str(COMPILED_DIR / "yolo26n_neuron.pt"))
     parser.add_argument(
         "--dtype",
@@ -81,7 +82,7 @@ def main() -> None:
     print(f"[trace] patched {n_attn} attention modules to avoid torch.split on Neuron")
     wrapper = YOLO26Wrapper(model).eval()
 
-    example = torch.zeros(1, 3, args.imgsz, args.imgsz, dtype=torch.float32)
+    example = torch.zeros(args.batch_size, 3, args.imgsz, args.imgsz, dtype=torch.float32)
 
     with torch.inference_mode():
         ref = wrapper(example)

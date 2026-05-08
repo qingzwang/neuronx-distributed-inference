@@ -50,39 +50,52 @@ def bench(
     warmup: int,
     imgsz: int,
 ) -> dict:
-    module = torch.jit.load(compiled_path)
-    device_ids = [f"nc:{i}" for i in range(num_cores)]
-    runner = torch_neuronx.DataParallel(module, device_ids=device_ids)
-    # DataParallel's default `num_workers=2` bottlenecks beyond 2 cores for a
-    # cheap model like yolo26n; give each core its own worker thread plus a bit
-    # of headroom so no core stalls waiting for the dispatcher.
-    runner.num_workers = max(2 * num_cores, 4)
+    """Place one NEFF copy per NeuronCore and dispatch concurrently.
 
-    # Batch size = num_cores (one image per core per step is the canonical data-parallel
-    # baseline; DataParallel will split dim 0 evenly across cores).
-    batch = _build_batch(image_paths, num_cores, imgsz)
+    `torch_neuronx.DataParallel` often routes every call through the core that
+    first loaded the module unless each replica is placed explicitly. Loading
+    under `neuron_cores_context(start_nc=i, nc_count=1)` pins replica i to
+    core i; a shared `ThreadPoolExecutor` then fires one traced call per core
+    in parallel. This matches the placement used by the reference AWS Neuron
+    YOLO26 benchmark and scales much closer to linear.
+    """
+    from concurrent.futures import ThreadPoolExecutor
 
-    # Warmup
+    modules = []
+    for i in range(num_cores):
+        with torch_neuronx.experimental.placement.neuron_cores_context(
+            start_nc=i, nc_count=1,
+        ):
+            modules.append(torch.jit.load(compiled_path))
+    pool = ThreadPoolExecutor(max_workers=max(2 * num_cores, 4))
+
+    # Each core processes one image per step (per-core batch is baked into the
+    # NEFF). Total images per step = num_cores.
+    t_single, _, _ = preprocess_image(str(image_paths[0]), imgsz=imgsz)
+
+    def step() -> None:
+        futs = [pool.submit(m, t_single) for m in modules]
+        for f in futs:
+            f.result()
+
     for _ in range(warmup):
-        _ = runner(batch)
+        step()
 
     timings: List[float] = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        _ = runner(batch)
+        step()
         timings.append((time.perf_counter() - t0) * 1000.0)
 
     arr = np.asarray(timings)
     batch_mean_ms = float(arr.mean())
     batch_p50_ms = float(np.median(arr))
-    # Per-image latency at this batch (wall clock / batch size)
     per_image_ms = batch_mean_ms / num_cores
-    # Throughput: images per second
     throughput = num_cores / (batch_mean_ms / 1000.0)
 
     return {
         "num_cores": num_cores,
-        "device_ids": device_ids,
+        "device_ids": [f"nc:{i}" for i in range(num_cores)],
         "batch_size": num_cores,
         "batch_mean_ms": batch_mean_ms,
         "batch_p50_ms": batch_p50_ms,
