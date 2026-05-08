@@ -130,6 +130,57 @@ output_bgr = postprocess_image(output_tensor)
 cv2.imwrite("upscaled.png", output_bgr)
 ```
 
+## Demo: 1K → 4K on 8 pinned NeuronCores
+
+End-to-end run through the pinned-replica pipeline: 1024×1024 input is tiled
+into 64 non-overlapping 128×128 blocks, each replica forwards its share in
+parallel (bf16, LNC=1), and the outputs are stitched back into a single
+4096×4096 image.
+
+Run it:
+
+```bash
+cd contrib/models/Real-ESRGAN
+python test/integration/demo_1k_to_4k.py \
+    --input /tmp/Real-ESRGAN/inputs/0014.jpg \
+    --iters 5 --warmup 2
+```
+
+Results are written to `results/<stem>_input_1024.png` and
+`results/<stem>_neuron_4x_4096.png`. Measured on trn2 with the LNC=1 bf16
+128×128 NEFF replicated to 8 NeuronCores:
+
+| Phase | Time |
+|-------|-----:|
+| Read image + center crop + Lanczos resize to 1024×1024 | 119 ms |
+| Preprocess (HWC uint8 BGR → CHW bf16) + tile into 64 blocks | 31 ms |
+| Load 8 pinned replicas (one-time startup) | 15,351 ms |
+| **Neuron forward (64 tiles, 8 cores, median over 5 iters)** | **447 ms** |
+| Stitch 64 output tiles + write 4K PNG | 826 ms |
+| **Steady-state per image (excludes one-time replica load)** | **~1.4 s** |
+
+Per-tile latency: **6.99 ms/tile**, throughput: **143 tiles/s**. The 5 timed
+iterations were `[430, 448, 447, 449, 442] ms` — stable to ±2%. Compared to
+the fp32 single-core baseline (48 ms/tile), the pinned 8-core bf16 pipeline
+is **~7× faster** on the same hardware; going to 32 cores pushes it to
+~1.67 ms/tile (see `BENCHMARK_PINNED_MULTICORE.md`).
+
+### Before / after
+
+Input (1024×1024, `inputs/0014.jpg` resized):
+
+![Input 1024×1024](results/0014_input_1024.jpg)
+
+Output (4096×4096, RealESRGAN_x4plus on Neuron):
+
+![Neuron 4x output](results/0014_neuron_4x_4096.jpg)
+
+> **Seam caveat**: this demo uses non-overlapping tiles so you will see faint
+> grid lines at 128-pixel boundaries in the output. Production pipelines should
+> use the overlapping tile loop from the upstream `RealESRGANer.tile_process`
+> (configurable `tile_pad`, typically 10–16 pixels) — the per-tile latency is
+> unchanged, only the number of tiles grows by a small constant.
+
 ## Running the Tests
 
 CPU unit tests (no Neuron hardware required):
