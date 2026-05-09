@@ -213,11 +213,17 @@ Two dispatcher bottlenecks stack on top of each other:
 `benchmark_sizes.py` does the same. If you run `reproduce_jimburtoft/`
 you get route A and see numbers that match the upstream notebook.
 
-## Multi-core throughput (fp32, `torch_neuronx.DataParallel`, 480x480, 30 iters)
+## Multi-core throughput (fp32, 480×480, BS/core = 1, 30 iters)
 
-Each step feeds one image per NeuronCore (`batch = num_cores`). Per-image
-latency is step wall-clock ÷ batch; `num_workers` is set to `2 × num_cores`
-so the dispatcher isn't the bottleneck.
+This is a **different workload** from the aligned sweep above: smaller
+input (480 vs 640), single-image-per-core (BS/core=1 vs 16 for x, 32 for
+s/m/l), all variants run in fp32. It exists to show how scaling behaves
+when every core is firing a latency-sensitive single-image call, and
+to let n/s/m/l/x be compared at identical input shape.
+
+Per-image latency below = step wall-clock ÷ (num_cores × 1).
+`num_workers` is set to `2 × num_cores` so the dispatcher isn't the
+bottleneck.
 
 | variant | 1 core (img/s) | 8 cores (img/s) | 32 cores (img/s) | 32-core per-image (ms) |
 | ------- | -------------: | --------------: | ---------------: | ---------------------: |
@@ -227,8 +233,24 @@ so the dispatcher isn't the bottleneck.
 | yolo26l |           78.0 |           514.5 |           1323.3 |                   0.76 |
 | yolo26x |           58.1 |           406.0 |           1066.2 |                   0.94 |
 
-yolo26**s** is the throughput sweet spot at 480x480 (1858 img/s across 32
-cores, 0.54 ms/image).
+yolo26**s** is the throughput sweet spot at 480×480 (1858 img/s across
+32 cores, 0.54 ms/image).
+
+### Why the aligned-at-640 yolo26x number (380 img/s) is close to this table's DP=8 (406 img/s)
+
+The two rows describe genuinely different pipelines so the near-overlap
+for yolo26x is a coincidence, not a bug:
+
+| config | input | dtype | BS/core | DP | images/step | throughput | per-image |
+| -------| -----:| ----- | ------: | -:|-----------:|-----------:|----------:|
+| **aligned (x)**          | 640×640 | bf16 weights | 16 | 8 | 128 |     380 img/s | **2.63 ms** |
+| **multi-core 480 (x)**   | 480×480 | fp32         |  1 | 8 |   8 |     406 img/s | **2.46 ms** |
+
+A larger input (640² ≈ 1.78× the pixels of 480²) is balanced against
+more per-core batching (BS=16 keeps the matmul engine fed, BS=1 leaves
+it bubbly), so per-image latencies end up only ~7 % apart. If both
+tables are read as *throughput-of-workload-X* rather than
+*yolo26x-on-Neuron-in-general*, there's no inconsistency.
 
 ## 640×640 with `--auto-cast` (yolo26n/s only)
 
