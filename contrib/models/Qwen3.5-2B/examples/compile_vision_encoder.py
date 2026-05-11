@@ -13,7 +13,13 @@ Usage:
     python3 examples/compile_vision_encoder.py \\
         --model-path /home/ubuntu/models/Qwen3.5-2B \\
         --out-dir    /home/ubuntu/traced_model/Qwen3.5-2B/vision \\
-        --buckets    256 1024 4096
+        --buckets    16 256 1024 4096
+
+The recommended bucket set [16, 256, 1024, 4096] keeps vision encode
+cheap across the full grid range (grid 4 -> 16, grid 16 -> 256,
+grid 32 -> 1024, grids 48/62 -> 4096). Without intermediate buckets,
+small grids pay 4096-bucket cost (~200 ms) regardless of true patch
+count; with them, grid 16 falls to ~7 ms and grid 32 to ~25 ms.
 """
 
 import argparse

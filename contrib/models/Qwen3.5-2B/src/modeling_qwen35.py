@@ -1268,7 +1268,23 @@ class NeuronQwen35Attention(NeuronAttentionBase):
         return Q, K, cos_cache, sin_cache
 
     def perform_prefill(self, Q, K, V, q_len, bsz, attention_mask=None):
-        """Prefill path with NKI flash attention for head_dim=256."""
+        """Prefill path with NKI flash attention for head_dim=256.
+
+        `attention_mask` is the 4D causal+padding mask built in
+        get_model_output (shape (B, 1, S, S), 1.0 for valid positions,
+        0.0 for masked). The flash-attention kernels only honor the
+        causal portion via `use_causal_mask=True` and do not consume an
+        explicit mask, so the softmax fallback below is the only path
+        that can mask the trailing pad positions of bucket-padded
+        prefill (e.g. grid 64 = 1044 real tokens padded to bucket 2048
+        with 1004 pad tokens).
+
+        For the flash-attention paths, we silently lose the padding
+        portion of the mask (causal-only); for the softmax fallback we
+        add an additive bias of -65504 * (1 - mask) so padding columns
+        are excluded from softmax. This makes the bucket-2048 prefill
+        for grid 64 produce real text instead of empty-reply.
+        """
         head_dim = Q.shape[-1]
 
         # Option B: nkilib flash attention for head_dim > 128
@@ -1320,6 +1336,17 @@ class NeuronQwen35Attention(NeuronAttentionBase):
                 diagonal=1,
             ).unsqueeze(0)
             attn_weights = attn_weights + causal_mask
+            # Apply 4D padding mask if provided. attention_mask is
+            # (B, 1, S, S) with 1.0 valid / 0.0 masked. After bmm we have
+            # (B*H, S, S) so broadcast B over heads via repeat.
+            if attention_mask is not None and attention_mask.ndim == 4:
+                # Squeeze head dim (=1) and broadcast over num_q_heads
+                pad_mask = attention_mask.squeeze(1)  # (B, S, S)
+                # Convert "1=valid, 0=mask" to additive "0=valid, -inf=mask"
+                pad_bias = (1.0 - pad_mask.to(attn_weights.dtype)) * -65504.0
+                # Repeat per-head to get (B*H, S, S)
+                pad_bias = pad_bias.repeat_interleave(num_q_heads, dim=0)
+                attn_weights = attn_weights + pad_bias
             attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
                 Q.dtype
             )

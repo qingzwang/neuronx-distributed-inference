@@ -102,13 +102,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="/home/ubuntu/models/Qwen3.5-2B")
     parser.add_argument("--compiled-path",
-                        default="/home/ubuntu/traced_model/Qwen3.5-2B-s2048-multibucket",
+                        default="/home/ubuntu/traced_model/Qwen3.5-2B-multibucket-tiny",
                         help="Directory with the compiled text decoder. "
-                             "Produced by examples/compile_text_decoder.py.")
+                             "Produced by examples/compile_text_decoder.py. "
+                             "Default uses tiny-bucket build [32,64,128,512,1024,2048] "
+                             "which gives ~55ms TTFT for short prompts.")
     parser.add_argument("--buckets", type=int, nargs="+",
-                        default=[128, 512, 1024, 2048],
+                        default=[32, 64, 128, 512, 1024, 2048],
                         help="CTE buckets the text decoder was compiled with. "
-                             "Must match compile-time config.")
+                             "Must match compile-time config. The 32/64 buckets give "
+                             "huge TTFT wins for short prompts (24 tok -> 56ms).")
     parser.add_argument("--vision-compiled-path",
                         default="/home/ubuntu/traced_model/Qwen3.5-2B/vision",
                         help="Directory with vision_encoder_{bucket}.pt files")

@@ -486,15 +486,35 @@ class NeuronQwen35VLForCausalLM:
             else:
                 vis_emb_padded = vis_emb[:, :pad_limit]
 
-            # Pad positions to (1, pad_limit, 1) with a SAFE fill value.
-            # CRITICAL: fill_value must be a valid index (within [0, pad_limit-1]).
-            # Using pad_limit-1 targets the last position (always a padding slot)
-            # so index_put_ scatters zero embeddings there harmlessly.
-            # NOTE: Do NOT use large sentinel values (e.g., 2**30) as they cause
-            # DGE out-of-bounds crashes in the Neuron runtime.
+            # Pad positions to (1, pad_limit, 1).
+            #
+            # The "filler" entries beyond n_vis must point at indices that
+            # the compiled graph will overwrite or never read. The earlier
+            # version filled them with `pad_limit - 1`, which equals
+            # `seq_len - 1` — the LAST REAL INPUT TOKEN. `index_put_` then
+            # scatters zero vision embeddings to that real position,
+            # zeroing the last token's text embedding. For most prompts
+            # this is harmless (the last token is `\n\n` or similar), but
+            # for grid 64 (n_vis=1024 == 2^10, plus a 20-token text tail
+            # that ends in the assistant turn marker `\n\n`) it
+            # consistently makes the model emit `\n\n<|im_end|>` and stop.
+            #
+            # Fix: anchor the filler index at a position that is
+            # guaranteed to be in the NxDI pad region after `pad_inputs`
+            # extends the buffers to the bucket length. We don't know the
+            # bucket size here, so we point at the maximum compiled bucket
+            # that NeuronConfig declares (which IS in pad region whenever
+            # n_vis < bucket, which always holds because the compiled
+            # buckets are >= input_ids.shape[1] >= n_vis + 19 chat-template
+            # tokens). If max_length isn't available we fall back to a
+            # large value clamped by NxDI's `pad_inputs` to padded_seq_len-1.
+            try:
+                safe_idx = self.text_config.neuron_config.seq_len - 1
+            except AttributeError:
+                safe_idx = pad_limit - 1
             positions_padded = torch.full(
                 (1, pad_limit, 1),
-                fill_value=pad_limit - 1,
+                fill_value=safe_idx,
                 dtype=torch.int32,
             )
             positions_padded[0, :n_vis, 0] = positions[:pad_limit].to(torch.int32)

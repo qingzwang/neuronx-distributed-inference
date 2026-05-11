@@ -3,22 +3,27 @@
 DeltaNet CTE is O(seq_len) even for short prompts because the NKI
 recurrent kernel walks every position in the compiled bucket. Multi-
 bucket compilation lets short prompts pick a short compiled graph,
-cutting TTFT proportionally:
+cutting TTFT proportionally. Per-bucket CTE on trn2.48xlarge TP=4:
 
-  bucket 128  -> CTE ~305 ms   (grid <= 8,  ~128 image px)
-  bucket 512  -> CTE ~690 ms   (grid <= 22, ~352 image px)
-  bucket 1024 -> CTE ~1367 ms  (grid <= 30, ~480 image px; also covers 62 via padding)
-  bucket 2048 -> CTE ~2735 ms  (grid <= 44, ~704 image px; grid 62 reuses 1024)
+  bucket   32 -> CTE   52 ms   (text-only short prompts; grid <=  4)
+  bucket   64 -> CTE   95 ms   (text-only medium prompts; grid <= 10)
+  bucket  128 -> CTE  305 ms   (grid <= 16, ~256 image px)
+  bucket  512 -> CTE  686 ms   (grid <= 32, ~512 image px)
+  bucket 1024 -> CTE 1366 ms   (grid <= 48; also covers 62 via padding)
+  bucket 2048 -> CTE 2735 ms   (grid 64 = 1024 vision tokens)
+
+The 32 and 64 buckets are the key TTFT wins: for a typical text-only
+chat prompt (~20 tok) we go from 305ms (bucket 128) to 52ms (bucket 32).
 
 NOTE: `USE_NKI=1` is required for the recurrent kernel. The default
 fused Neumann kernel is faster on short prompts but NaNs on long
 prefill; the recurrent kernel is numerically stable up through
-grid=62 (992x992 image, 981-token prompt).
+grid=64 (1024x1024 image, 1044-token prompt).
 
 Usage:
     USE_NKI=1 python3 examples/compile_text_decoder.py \\
-        --out /home/ubuntu/traced_model/Qwen3.5-2B-s2048-multibucket \\
-        --buckets 128 512 1024 2048
+        --out /home/ubuntu/traced_model/Qwen3.5-2B-multibucket-tiny \\
+        --buckets 32 64 128 512 1024 2048
 """
 
 import argparse
@@ -47,9 +52,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", default="/home/ubuntu/models/Qwen3.5-2B")
     ap.add_argument("--out",
-                    default="/home/ubuntu/traced_model/Qwen3.5-2B-s2048-multibucket")
+                    default="/home/ubuntu/traced_model/Qwen3.5-2B-multibucket-tiny")
     ap.add_argument("--buckets", type=int, nargs="+",
-                    default=[128, 512, 1024, 2048])
+                    default=[32, 64, 128, 512, 1024, 2048])
     ap.add_argument("--tp-degree", type=int, default=4)
     args = ap.parse_args()
 
