@@ -450,6 +450,19 @@ class NeuronGatedDeltaNet(nn.Module):
             diagonal=0,
         )
 
+        # NOTE: This per-chunk Python-loop path is exact vs FLA reference
+        # in standalone XLA tests (1e-7 max abs err on 4-chunk inputs,
+        # see test/integration/test_chunked_kernel.py) and is much
+        # faster than the recurrent path (CTE 60 ms vs 686 ms for
+        # bucket=512 = 11x). However, when this loop is embedded inside
+        # the full traced NeuronModel forward, multi-chunk runs produce
+        # wrong outputs (empty / `<|image_pad|>` first token). 1-chunk
+        # runs (bucket <= 128) work correctly. Tried: .clone(), *1.0,
+        # pre-allocated zero_states, optimization_barrier_, -O2,
+        # reversed tuple order — none fix the issue. HLO is correct
+        # (state_in of chunk N+1 is properly tied to get-tuple-element
+        # of chunk N). Bug is in NEFF-level HBM allocation. Likely needs
+        # an upstream Neuron compiler fix.
         all_outputs = []
         all_states = []
         for bh in range(BH):
@@ -2594,8 +2607,11 @@ class NeuronQwen35ForCausalLM(NeuronBaseForCausalLM):
         return outputs, is_run_on_neuron
 
     def get_compiler_args(self):
+        # Allow forcing -O0 via env to debug compiler-induced numerical
+        # bugs in multi-chunk paths (e.g. USE_NKI_CHUNKED with bucket
+        # >128). The default -O1 is recommended for production.
         if self.compile_tag == CONTEXT_ENCODING_MODEL_TAG:
-            optimization_level = "-O1"
+            optimization_level = os.environ.get("CTE_OPT_LEVEL", "-O1")
         else:
             optimization_level = "-O1"
 

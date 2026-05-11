@@ -241,15 +241,52 @@ neuron_config = NeuronConfig(
 )
 ```
 
+## DeltaNet path selection (env vars)
+
+The DeltaNet CTE supports several backends; switch via env vars:
+
+| Env var | Path | Notes |
+|---------|------|-------|
+| (default) | `_fused_chunked_forward` (NKI, Neumann) | Fast on short prompts; NaNs >~30 tokens |
+| `USE_NKI=1` | `_nki_recurrent_forward` (per-token NKI) | Stable up to grid 62 (~981 tokens) |
+| `USE_NKI_CHUNKED=1` | `_nki_chunked_forward` (NKI, per-chunk) | Per-chunk HBM round-trips |
+| `USE_PYTORCH_CHUNK=1` | `_chunk_forward` (eager pytorch) | Hits compiler ICE on 2B dims |
+| `USE_FLA=1` | `_flash_linear_attention_forward` (fp32 ref) | Spec-correct fp32 reference; works on CPU |
+| `DELTANET_SEQUENTIAL=1` | `_sequential_forward` | Eager fallback |
+
+`USE_FLA=1` automatically activates when running on CPU (no Neuron device).
+The implementation lives in `src/fla_reference.py` and exposes the same
+signatures as `fla.ops.gated_delta_rule.{chunk,fused_recurrent}_gated_delta_rule`.
+
 ## Known Issues
 
 1. **SDK 2.29+ required:** The NKI DeltaNet kernels require NKI 0.3.0 (SDK 2.29).
 
 2. **PyTorch chunked forward hits compiler ICE on 2B dimensions:** The `_chunk_forward` path creates 5D tensors that trigger neuronx-cc codegen crash (NCC_INLA001). The fused NKI kernel is the default and required CTE path. Controlled via `USE_NKI_FUSED` env var (defaults to enabled).
 
-3. **No mini model test:** DeltaNet layers require NKI kernels that only execute on Neuron devices. All integration tests require a trn2 instance with full model weights.
+3. **No mini model test for DeltaNet kernels on Neuron:** DeltaNet layers require NKI kernels that only execute on Neuron devices. The flash-linear-attention reference (`USE_FLA=1`) does run on CPU and is exercised by `test/unit/test_fla_reference.py`.
 
 4. **Chat template required for quality output:** Raw text prompts produce echoey/repetitive output. Always use `tokenizer.apply_chat_template()`.
+
+5. **VL grid 64 (1024 vision tokens, 1024x1024 image) — FIXED 2026-05-09.**
+   The empty-reply behaviour for `grid_size=64` was caused by
+   `Qwen35VLForCausalLM.generate` filling the trailing entries of
+   `positions_padded` with `pad_limit - 1`, which equals the index of
+   the LAST REAL INPUT TOKEN. The downstream `index_put_` then scattered
+   zero vision embeddings to that position, zeroing the last token's
+   text embedding (`\n\n` of the assistant turn marker). For grid 64
+   specifically (n_vis=1024 + 20-token text tail), this reliably made
+   the model emit `\n\n<|im_end|>` and stop. The fix anchors the
+   sentinel inside the NxDI pad region (`max_bucket - 1`, clamped by
+   `pad_inputs` to `current_bucket - 1`) so trailing scatters land on
+   throw-away pad slots. Verified end-to-end on the existing compiled
+   model (no recompile needed) — grid 64 now produces detailed
+   Bulbasaur descriptions equivalent to grid 62.
+
+   The current upper bound is now imposed by the largest compiled
+   vision bucket (4096 patches → grid 64; grid 66 = 4356 patches
+   exceeds the 4096-patch graph and would need a 4356- or 16384-patch
+   bucket compiled).
 
 ## Maintainer
 
