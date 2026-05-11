@@ -70,6 +70,10 @@ from src.nki_kernels.nki_deltanet_fused import (
     _make_lower_mask_diag,
     _make_identity,
 )
+from src.fla_reference import (
+    chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
+    recurrent_gated_delta_rule as _fla_recurrent_gated_delta_rule,
+)
 
 from neuronx_distributed_inference.models.config import (
     InferenceConfig,
@@ -611,6 +615,31 @@ class NeuronGatedDeltaNet(nn.Module):
         final_state = state if output_final_state else None
         return output, final_state
 
+    def _flash_linear_attention_forward(
+        self, query, key, value, g, beta, output_final_state=False
+    ):
+        """flash-linear-attention chunked path (fp32 reference impl).
+
+        Uses the same math as `fla.ops.gated_delta_rule.chunk_gated_delta_rule`
+        but in pure fp32 PyTorch so it runs anywhere (CPU, Neuron via XLA).
+        Inputs to this method are already l2-normed and query is scaled by
+        1/sqrt(K) by the caller, so we pass `use_qk_l2norm_in_kernel=False`
+        and `scale=1.0` to avoid double-applying.
+
+        This path is used when `USE_FLA=1` is set or when the model runs on
+        CPU (no NKI kernels available there). It is the reference against
+        which the NKI kernels are validated, so any divergence between this
+        and the fused NKI kernel is a kernel bug.
+        """
+        out, final_state = _fla_chunk_gated_delta_rule(
+            query, key, value, g, beta,
+            chunk_size=64,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=False,
+            scale=1.0,
+        )
+        return out, (final_state if output_final_state else None)
+
     def _chunk_forward(self, query, key, value, g, beta, output_final_state=False):
         """Chunk-based forward for context encoding (prefill)."""
         chunk_size = 64
@@ -915,8 +944,17 @@ class NeuronGatedDeltaNet(nn.Module):
             use_nki = os.environ.get("USE_NKI") == "1"
             use_sequential = os.environ.get("DELTANET_SEQUENTIAL") == "1"
             use_pytorch_chunk = os.environ.get("USE_PYTORCH_CHUNK") == "1"
+            # USE_FLA=1 selects the flash-linear-attention reference path
+            # (fp32 chunked gated delta rule). It is the spec-correct
+            # baseline used to validate the NKI kernels and the
+            # CPU-runnable fallback for environments without Neuron.
+            use_fla = os.environ.get("USE_FLA") == "1" or cpu_mode()
 
-            if use_pytorch_chunk:
+            if use_fla:
+                output, final_state = self._flash_linear_attention_forward(
+                    query, key, value, g, beta, output_final_state=True
+                )
+            elif use_pytorch_chunk:
                 output, final_state = self._chunk_forward(
                     query, key, value, g, beta, output_final_state=True
                 )
