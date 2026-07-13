@@ -14,7 +14,7 @@ This contrib copies the 2B modeling code (`modeling_qwen35*.py`,
 `nki_kernels/*`, `hybrid_apc.py`) verbatim — everything is config-driven. No
 NxDI-library modifications are required — runs on the stock
 `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/` DLAMI venv
-(Neuron SDK 2.29 / NKI 0.3.0).
+(`neuronx-cc` 2.26.6360 / `nki` 0.5.0).
 
 **Status:** text-only and vision-language inference are both validated
 end-to-end on `trn2.48xlarge` at TP=8. VL requires the legacy-direct
@@ -53,10 +53,13 @@ Qwen3.5-27B/
 | Component | Version |
 |---|---|
 | Instance | `trn2.48xlarge` (validated at TP=8) |
-| Neuron SDK | 2.29 (NKI 0.3.0) |
-| Python | 3.12 |
-| `torch` | 2.9.1 (torch-neuronx 2.9.0.2) |
+| `neuronx-cc` | 2.26.6360.0 |
+| `nki` | 0.5.0 |
+| `neuronx-distributed` | 0.19.28492 |
 | `neuronx-distributed-inference` | 0.10.18399 |
+| `torch-neuronx` | 2.9.0.2 (torch 2.9.1) |
+| `libneuronxla` | 2.2.17544 |
+| Python | 3.12 |
 | `transformers` | 4.57.6 (Neuron runtime). HF CPU reference needs ≥ 5.13. |
 
 ## Checkpoint
