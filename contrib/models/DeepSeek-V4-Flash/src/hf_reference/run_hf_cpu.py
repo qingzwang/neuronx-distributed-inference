@@ -197,6 +197,10 @@ def main():
     ap.add_argument("--forward-smoke", action="store_true",
                     help="After load, do a 1-token forward and print top-K logits.")
     ap.add_argument("--prompt", default="The capital of France is")
+    ap.add_argument("--max-new-tokens", type=int, default=0,
+                    help="If >0, greedy-decode this many tokens after prefill "
+                         "and print the completion. Uses the model's built-in "
+                         "kv_cache via start_pos.")
     args = ap.parse_args()
 
     torch.set_default_dtype(torch.bfloat16)
@@ -226,11 +230,39 @@ def main():
             logits = model(ids, 0)
         print(f"[fwd] logits.shape={list(logits.shape)}  "
               f"({time.perf_counter()-t0:.1f}s)")
-        # Print top-5 next tokens
+        # Print top-5 next tokens for the prefill result
         topk = logits[0].topk(5)
         for score, idx in zip(topk.values.tolist(), topk.indices.tolist()):
             tok_str = tok.decode([idx])
             print(f"    {idx:>7}  {score:7.2f}  {tok_str!r}")
+
+    if args.max_new_tokens > 0:
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(args.ckpt_dir)
+        ids = tok(args.prompt, return_tensors="pt").input_ids
+        prompt_len = ids.shape[1]
+        buf_len = min(m_args.max_seq_len, prompt_len + args.max_new_tokens)
+        buffer = torch.full((1, buf_len), -1, dtype=torch.long)
+        buffer[0, :prompt_len] = ids[0]
+        prev_pos = 0
+        print(f"[gen] prompt tokens: {prompt_len}, generating up to "
+              f"{args.max_new_tokens} tokens (buf_len={buf_len})")
+        t0 = time.perf_counter()
+        for cur_pos in range(prompt_len, buf_len):
+            step_ids = buffer[:, prev_pos:cur_pos]
+            with torch.inference_mode():
+                step_logits = model(step_ids, prev_pos)
+            next_tok = step_logits[0].argmax().item()
+            buffer[0, cur_pos] = next_tok
+            prev_pos = cur_pos
+            if next_tok == tok.eos_token_id:
+                break
+        dt = time.perf_counter() - t0
+        n_new = int((buffer[0] != -1).sum()) - prompt_len
+        gen_ids = buffer[0, prompt_len:prompt_len + n_new].tolist()
+        gen_text = tok.decode(gen_ids, skip_special_tokens=True)
+        print(f"[gen] {n_new} tokens in {dt:.1f}s ({dt/max(n_new,1)*1000:.0f} ms/tok)")
+        print(f"[gen] output: {gen_text!r}")
 
 
 if __name__ == "__main__":
