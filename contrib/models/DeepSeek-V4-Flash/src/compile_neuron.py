@@ -95,6 +95,79 @@ def _wire_shims():
     sys.modules["fast_hadamard_transform"] = mod
 
 
+def _patch_moe_forward_for_xla(hf_mod):
+    """Replace HF's dispatch-based MoE.forward with a static-shape one.
+
+    The HF reference does:
+
+        counts = torch.bincount(indices.flatten(), minlength=N).tolist()
+        for i in range(start, end):
+            if counts[i] == 0: continue
+            idx, top = torch.where(indices == i)
+            y[idx] += expert_i(x[idx], weights[idx, top, None])
+
+    This is GPU-only:
+      * `bincount(...).tolist()` forces a device->host sync
+      * data-dependent `if counts[i] == 0: continue`
+      * `torch.where`-driven scatter with variable-length gathers
+
+    For XLA/Neuron all shapes must be static. Rewrite in the "run every
+    expert on every token, mask with routing weights" style — mathematically
+    identical to the dispatch version, but much more work than the sparse
+    reference. Fine for correctness validation at small n_layers; at full
+    43 layers × 256 experts this will be prohibitively slow (~256/6 = 42x
+    the FLOPs a proper dispatched impl would do). For that we would need
+    to plug in NxDI's expert_mlps_v2, but this static rewrite is enough
+    to validate the *rest* of the graph compiles.
+    """
+    import torch as _torch
+    import torch.nn.functional as _F
+
+    def moe_forward_xla(self, x: _torch.Tensor, input_ids: _torch.Tensor):
+        shape = x.size()
+        x = x.view(-1, self.dim)                      # (T, D)
+        weights, indices = self.gate(x, input_ids.flatten())
+        # weights, indices: (T, top_k)
+        T = x.size(0)
+        k = weights.size(-1)
+
+        # Build a one-hot-ish routing mask over all local experts.
+        # weight_per_expert[t, e] = sum over k of weights[t, k] * (indices[t, k] == e)
+        # Vectorize via scatter_add.
+        wpe = _torch.zeros(
+            T, self.n_local_experts, dtype=weights.dtype, device=weights.device,
+        )
+        # Only consider indices that fall inside our local expert range.
+        local_indices = indices - self.experts_start_idx
+        in_range = (local_indices >= 0) & (local_indices < self.n_local_experts)
+        safe_local = local_indices.clamp(min=0, max=self.n_local_experts - 1)
+        # weights_masked[t, k] = weights[t, k] if in_range else 0.0
+        weights_masked = weights * in_range.to(weights.dtype)
+        # scatter-add into wpe[t, safe_local[t, k]]
+        wpe.scatter_add_(1, safe_local, weights_masked)
+
+        # Run every local expert on every token (static shapes) and combine
+        # by wpe (which is zero for tokens the expert wasn't routed to).
+        y = _torch.zeros_like(x, dtype=_torch.float32)
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            expert = self.experts[i]
+            # w_e is per-token gating for this expert
+            w_e = wpe[:, i - self.experts_start_idx].unsqueeze(-1)  # (T, 1)
+            # expert receives (x, weight) and returns a scaled contribution
+            y = y + expert(x, w_e).float()
+
+        # world_size / dist live at the model.py module scope; look them up
+        # at call time so this patched forward sees updates that happen after
+        # Transformer.__init__ mutates them.
+        if hf_mod.world_size > 1:
+            import torch.distributed as _dist
+            _dist.all_reduce(y)
+        y = y + self.shared_experts(x).float()
+        return y.type_as(x).view(shape)
+
+    hf_mod.MoE.forward = moe_forward_xla
+
+
 def _patch_hf_model_for_xla(hf_mod):
     """Replace complex-tensor RoPE with a real-valued equivalent.
 
@@ -203,28 +276,32 @@ def _build_model_args(hf_mod):
 
 
 class _TraceWrapper(torch.nn.Module):
-    """Wrap the HF Transformer to bypass its @torch.inference_mode() decorator.
+    """Wrap the HF Transformer for XLA tracing.
 
-    parallel_model_trace uses torch-xla, which needs to bump tensor version
-    counters during tracing. Tensors created inside @inference_mode() are
-    frozen and cannot record versions, causing:
-      RuntimeError: Cannot set version_counter for inference tensor.
-    We call the underlying forward directly with plain no_grad instead.
+    Two adjustments vs the raw HF Transformer.forward:
+      1. Bypass the @torch.inference_mode() decorator, which conflicts with
+         torch-xla's tensor version counter tracking:
+           RuntimeError: Cannot set version_counter for inference tensor
+      2. Accept `start_pos` as a scalar int tensor rather than a Python int,
+         because torch.jit.trace / torch_neuronx.trace only accepts
+         Tensor / List[Tensor] / Dict[..., Tensor] / Tuple[Tensor, ...].
     """
 
     def __init__(self, inner: torch.nn.Module):
         super().__init__()
         self.inner = inner
 
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+    def forward(self, input_ids: torch.Tensor, start_pos: torch.Tensor):
+        # start_pos is a 0-d int tensor; the HF code uses it as a Python int
+        # to slice freqs_cis and index kv_cache. Convert via .item() — this
+        # bakes the value into the trace, which is fine for the CTE (prefill)
+        # graph where start_pos = 0 is a compile-time constant.
         with torch.no_grad():
-            # Peel the @torch.inference_mode() decorator. HF's Transformer.forward
-            # is a plain function attribute; getattr(func, "__wrapped__", func)
-            # gives the un-decorated function.
+            pos = int(start_pos.item()) if start_pos.dim() == 0 else int(start_pos)
             raw = getattr(self.inner.forward, "__wrapped__", None)
             if raw is not None:
-                return raw(self.inner, input_ids, start_pos)
-            return self.inner.forward(input_ids, start_pos)
+                return raw(self.inner, input_ids, pos)
+            return self.inner.forward(input_ids, pos)
 
 
 def _picklable_factory():
@@ -235,6 +312,7 @@ def _picklable_factory():
     _wire_shims()
     import model as hf
     _patch_hf_model_for_xla(hf)
+    _patch_moe_forward_for_xla(hf)
     torch.set_default_dtype(torch.bfloat16)
     m_args = _build_model_args(hf)
     m = hf.Transformer(m_args).eval()
@@ -268,9 +346,15 @@ def _picklable_checkpoint_loader():
 
 
 def _example_inputs():
-    """input_ids: (B, S), start_pos: int → HF Transformer.forward signature."""
+    """input_ids: (B, S), start_pos: 0-d int tensor.
+
+    HF's Transformer.forward takes `start_pos: int`; _TraceWrapper accepts
+    a scalar tensor and passes .item() through. torch.jit.trace refuses
+    Python-int inputs in the example-inputs tuple, so we wrap in a tensor.
+    """
     ids = torch.zeros(_MAX_BATCH_SIZE, _SEQ_LEN, dtype=torch.long)
-    return (ids, 0)
+    start_pos = torch.zeros((), dtype=torch.int32)
+    return (ids, start_pos)
 
 
 def main():
