@@ -40,21 +40,60 @@ from pathlib import Path
 
 import torch
 
-# Ensure our package is importable as `hf_reference.kernel_cpu` and that we can
-# also inject it as bare `kernel` (which is how the HF reference imports it).
+# Ensure our package is importable as `hf_reference.kernel_cpu` (i.e. put
+# `src/` on sys.path). Also add `src/` for `from src.dequant_checkpoint import ...`
+# by putting the contrib root on sys.path too.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_CONTRIB_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
-if _CONTRIB_ROOT not in sys.path:
-    sys.path.insert(0, _CONTRIB_ROOT)
+_SRC_DIR = os.path.abspath(os.path.join(_HERE, ".."))            # .../src
+_CONTRIB_MODEL_DIR = os.path.abspath(os.path.join(_HERE, "..", "..")) # .../DeepSeek-V4-Flash
+for p in (_SRC_DIR, _CONTRIB_MODEL_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 # Path to HF's cloned inference/ dir (comes with the checkpoint download)
 _HF_INFERENCE_DIR = "/mnt/nvme/models/DeepSeek-V4-Flash/inference"
 
 
 def _wire_cpu_kernel():
-    """Make `import kernel` in HF's model.py resolve to our CPU shim."""
+    """Make `import kernel` in HF's model.py resolve to our CPU shim, and
+    provide a pure-PyTorch stand-in for `fast_hadamard_transform` (Tri Dao's
+    package; the pip install requires CUDA)."""
     from hf_reference import kernel_cpu
     sys.modules["kernel"] = kernel_cpu
+
+    # Fake fast_hadamard_transform via a natural-order Hadamard matrix.
+    # rotate_activation() calls hadamard_transform(x, scale=1/sqrt(d)); for the
+    # dims used in DeepSeek-V4 (rope_head_dim=64, index_head_dim=128), a plain
+    # torch matmul against a precomputed H_d is fine on CPU.
+    import types
+    import torch as _torch
+
+    def _hadamard_matrix(n: int) -> "_torch.Tensor":
+        assert n > 0 and (n & (n - 1)) == 0, f"n must be power-of-2, got {n}"
+        H = _torch.tensor([[1.0]], dtype=_torch.float32)
+        while H.size(0) < n:
+            H = _torch.cat([_torch.cat([H, H], dim=1),
+                            _torch.cat([H, -H], dim=1)], dim=0)
+        return H
+
+    _H_CACHE: dict = {}
+
+    def hadamard_transform(x: "_torch.Tensor", scale: float = 1.0) -> "_torch.Tensor":
+        d = x.size(-1)
+        if d not in _H_CACHE:
+            _H_CACHE[d] = _hadamard_matrix(d)
+        H = _H_CACHE[d].to(x.dtype).to(x.device)
+        return _torch.matmul(x, H) * scale
+
+    mod = types.ModuleType("fast_hadamard_transform")
+    mod.hadamard_transform = hadamard_transform
+    # importlib.util.find_spec (used by transformers>=5.0's package probe)
+    # requires __spec__ to be set on faked modules.
+    import importlib.machinery
+    mod.__spec__ = importlib.machinery.ModuleSpec(
+        "fast_hadamard_transform", loader=None,
+    )
+    sys.modules["fast_hadamard_transform"] = mod
 
 
 def _import_hf_model():
@@ -104,7 +143,7 @@ def load_weights_streaming(model, ckpt_dir: str, limit_shards: int = 0):
     at a time so we never hold >1 shard of dequantized weights in RAM."""
     # We reuse dequant_shard, which returns dict[str, bf16 tensor] for weights
     # and passthrough for everything else. Then we copy_ into model params.
-    from src.dequant_checkpoint import dequant_shard  # type: ignore
+    from dequant_checkpoint import dequant_shard  # type: ignore  # via _SRC_DIR on sys.path
 
     from glob import glob
     shards = sorted(glob(os.path.join(ckpt_dir, "model-*.safetensors")))
