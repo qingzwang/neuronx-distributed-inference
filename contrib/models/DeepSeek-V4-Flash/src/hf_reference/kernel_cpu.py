@@ -149,9 +149,17 @@ def sparse_attn(
     scores = torch.einsum("bmhd,bmtd->bmht", q.float(), kv_gathered.float())
     scores = scores * softmax_scale
 
-    # Mask out pad slots
-    if pad_mask.any():
-        scores = scores.masked_fill(pad_mask.unsqueeze(2), float("-inf"))
+    # Mask out pad slots. Use an additive bias built via subtraction rather
+    # than a python-level `if pad_mask.any(): masked_fill` branch, because
+    # data-dependent control flow is not XLA-safe.
+    #
+    # We use a large finite negative bias (not float("-inf")) to avoid
+    # nan-in-softmax when adding -inf to already-negative values, and to
+    # keep the math XLA-safe (0.0 * -inf == nan, which torch.where via bool
+    # tensor also produces via CPU-typed intermediates on some builds).
+    LARGE_NEG = -1e30
+    additive = pad_mask.to(scores.dtype).unsqueeze(2) * LARGE_NEG
+    scores = scores + additive
 
     # Softmax with an attn_sink slot: numerically stable with logsumexp.
     # Effectively softmax over [scores || sink] but we don't materialize the
@@ -163,8 +171,10 @@ def sparse_attn(
     scores = scores - max_with_sink
     sink_term = (sink_bias - max_with_sink).exp()   # (b, m, h, 1)
     weights = scores.exp()                          # (b, m, h, topk)
-    if pad_mask.any():
-        weights = weights.masked_fill(pad_mask.unsqueeze(2), 0.0)
+    # Same idea as the -inf mask above: cast bool -> float and multiply.
+    # weights * 1.0 = weights (kept); weights * 0.0 = 0 (masked out).
+    keep = (~pad_mask).to(weights.dtype).unsqueeze(2)
+    weights = weights * keep
     denom = weights.sum(dim=-1, keepdim=True) + sink_term
     weights = weights / denom
 
