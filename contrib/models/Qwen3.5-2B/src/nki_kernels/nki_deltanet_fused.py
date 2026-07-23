@@ -73,6 +73,9 @@ SOLVE_ACTIVE_PREFIX_K = os.environ.get(
     "0",
 ).lower() not in ("0", "false", "no", "off")
 SOLVE_MODE = os.environ.get("QWEN36_DELTANET_SOLVE_MODE", "doubling").lower()
+# Within-block solve: exact forward substitution (default, backward-stable on
+# correlated keys) vs Neumann/doubling series (opt-in, faster but unstable).
+SOLVE_SUBST = os.environ.get("QWEN36_DELTANET_SOLVE_SUBST", "1").lower() not in ("0", "false", "no", "off")
 AUTOCP_CP_CHUNKS = int(os.environ.get("QWEN36_DELTANET_AUTOCP_CP_CHUNKS", "4"))
 if SOLVE_MODE not in ("doubling", "kkt_hier"):
     raise ValueError(
@@ -222,7 +225,24 @@ def _hierarchical_kkt_solve128(v_new, A_T, Imat, solve_rhs, dim):
     nisa.tensor_copy(dst=v_new, src=solved_psum)
 
 
-def _blocked_doubling_solve(v_new, A_T, solve_rhs, dim):
+def _blocked_doubling_solve(v_new, A_T, solve_rhs, dim, Imat):
+    # Solve (I - A) v = rhs for strictly-lower-triangular A, block by block.
+    #
+    # Cross-block coupling is an exact matmul (A[block, :block_start] @ v_prev).
+    # Within each diagonal block we invert (I - A_diag).  Two strategies:
+    #
+    #   SOLVE_SUBST (default): exact forward substitution, one solved row per
+    #     step.  Backward-stable regardless of conditioning.  REQUIRED for
+    #     inputs with highly correlated keys (e.g. real vision embeddings whose
+    #     large per-dim DC mean makes l2-normalized keys near-parallel, cos>0.99).
+    #     For such A the Neumann/doubling series has huge transient growth in
+    #     the intermediate powers A^k (they reach ~1e15 in fp32 before the
+    #     nilpotent cancellation), overflowing fp32 and producing NaN/degenerate
+    #     output.  Substitution never forms A^k, so it stays exact (~1e-7).
+    #
+    #   doubling (opt-in): (I-A_diag)^-1 = (I+A)(I+A^2)(I+A^4)... via repeated
+    #     squaring; log2(block) matmuls, faster but numerically unstable on
+    #     correlated keys (see above).
     for solve_block in nl.static_range(CHUNK_SIZE // SOLVE_BLOCK_SIZE):
         block_start = solve_block * SOLVE_BLOCK_SIZE
         block_end = block_start + SOLVE_BLOCK_SIZE
@@ -278,105 +298,164 @@ def _blocked_doubling_solve(v_new, A_T, solve_rhs, dim):
             src=A_T[block_start:block_end, block_start:block_end],
         )
 
-        A_power_T = nl.ndarray(
-            (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-        )
-        nisa.tensor_copy(dst=A_power_T, src=A_diag_T)
-
-        A_power_psum = nl.ndarray(
-            (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-            dtype=nl.float32,
-            buffer=nl.psum,
-        )
-        nisa.nc_transpose(dst=A_power_psum, data=A_power_T)
-        A_power = nl.ndarray(
-            (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-            dtype=nl.float32,
-            buffer=nl.sbuf,
-        )
-        nisa.tensor_copy(dst=A_power, src=A_power_psum)
-
         local_v = nl.ndarray(
             (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
         )
-        nisa.tensor_copy(dst=local_v, src=residual_block)
 
-        for _scan_i in nl.static_range(SOLVE_SCAN_STEPS):
-            correction_psum = nl.ndarray(
-                (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.psum
-            )
-            nisa.nc_matmul(
-                dst=correction_psum,
-                stationary=A_power_T,
-                moving=local_v,
-            )
-            correction = nl.ndarray(
-                (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
-            )
-            nisa.tensor_copy(dst=correction, src=correction_psum)
-
-            local_next = nl.ndarray(
-                (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
-            )
-            nisa.tensor_tensor(
-                dst=local_next, data1=local_v, data2=correction, op=nl.add
-            )
-
-            nisa.tensor_copy(dst=local_v, src=local_next)
-
-            if _scan_i == SOLVE_SCAN_STEPS - 2:
-                A_power_next_T_psum = nl.ndarray(
-                    (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-                    dtype=nl.float32,
-                    buffer=nl.psum,
+        if SOLVE_SUBST:
+            # Exact forward substitution within the diagonal block.
+            # nc_matmul(stationary=A_diag_T, moving=local_v) = A_diag @ local_v.
+            # A_diag is strictly lower triangular, so row i depends only on
+            # rows < i, all solved in earlier iterations.  We select exactly
+            # one solved row per step via a one-hot mask.
+            nisa.memset(dst=local_v, value=0.0)
+            for solve_i in nl.static_range(SOLVE_BLOCK_SIZE):
+                row_psum = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.psum
                 )
                 nisa.nc_matmul(
-                    dst=A_power_next_T_psum,
-                    stationary=A_power,
-                    moving=A_power_T,
+                    dst=row_psum, stationary=A_diag_T, moving=local_v
                 )
-                nisa.tensor_copy(dst=A_power_T, src=A_power_next_T_psum)
-            elif _scan_i != SOLVE_SCAN_STEPS - 1:
-                A_power_next_psum = nl.ndarray(
-                    (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-                    dtype=nl.float32,
-                    buffer=nl.psum,
+                row_prod = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.tensor_copy(dst=row_prod, src=row_psum)
+
+                row_with_rhs = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.tensor_tensor(
+                    dst=row_with_rhs,
+                    data1=row_prod,
+                    data2=residual_block,
+                    op=nl.add,
+                )
+
+                # One-hot selector for row solve_i.  Reading a column of the
+                # identity matrix is partition-alignment-safe; memset-ing a
+                # single partition offset is not (BIR verifier rejects it).
+                row_mask = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, 1), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.tensor_copy(
+                    dst=row_mask[0:SOLVE_BLOCK_SIZE, 0:1],
+                    src=Imat[0:SOLVE_BLOCK_SIZE, solve_i : solve_i + 1],
+                )
+
+                row_update = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.tensor_scalar(
+                    dst=row_update,
+                    data=row_with_rhs,
+                    op0=nl.multiply,
+                    operand0=row_mask,
+                    engine=nisa.vector_engine,
+                )
+
+                v_next = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
+                )
+                nisa.tensor_tensor(
+                    dst=v_next, data1=local_v, data2=row_update, op=nl.add
+                )
+                nisa.tensor_copy(dst=local_v, src=v_next)
+        else:
+            A_power_T = nl.ndarray(
+                (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_copy(dst=A_power_T, src=A_diag_T)
+
+            A_power_psum = nl.ndarray(
+                (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                dtype=nl.float32,
+                buffer=nl.psum,
+            )
+            nisa.nc_transpose(dst=A_power_psum, data=A_power_T)
+            A_power = nl.ndarray(
+                (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                dtype=nl.float32,
+                buffer=nl.sbuf,
+            )
+            nisa.tensor_copy(dst=A_power, src=A_power_psum)
+
+            nisa.tensor_copy(dst=local_v, src=residual_block)
+
+            for _scan_i in nl.static_range(SOLVE_SCAN_STEPS):
+                correction_psum = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.psum
                 )
                 nisa.nc_matmul(
-                    dst=A_power_next_psum,
+                    dst=correction_psum,
                     stationary=A_power_T,
-                    moving=A_power,
+                    moving=local_v,
                 )
-                A_power_next = nl.ndarray(
-                    (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-                    dtype=nl.float32,
-                    buffer=nl.sbuf,
+                correction = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
                 )
-                nisa.tensor_copy(dst=A_power_next, src=A_power_next_psum)
+                nisa.tensor_copy(dst=correction, src=correction_psum)
 
-                A_power_next_T_psum = nl.ndarray(
-                    (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-                    dtype=nl.float32,
-                    buffer=nl.psum,
+                local_next = nl.ndarray(
+                    (SOLVE_BLOCK_SIZE, dim), dtype=nl.float32, buffer=nl.sbuf
                 )
-                nisa.nc_transpose(dst=A_power_next_T_psum, data=A_power_next)
-                A_power_next_T = nl.ndarray(
-                    (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
-                    dtype=nl.float32,
-                    buffer=nl.sbuf,
+                nisa.tensor_tensor(
+                    dst=local_next, data1=local_v, data2=correction, op=nl.add
                 )
-                nisa.tensor_copy(dst=A_power_next_T, src=A_power_next_T_psum)
 
-                nisa.tensor_copy(dst=A_power, src=A_power_next)
-                nisa.tensor_copy(dst=A_power_T, src=A_power_next_T)
+                nisa.tensor_copy(dst=local_v, src=local_next)
+
+                if _scan_i == SOLVE_SCAN_STEPS - 2:
+                    A_power_next_T_psum = nl.ndarray(
+                        (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                        dtype=nl.float32,
+                        buffer=nl.psum,
+                    )
+                    nisa.nc_matmul(
+                        dst=A_power_next_T_psum,
+                        stationary=A_power,
+                        moving=A_power_T,
+                    )
+                    nisa.tensor_copy(dst=A_power_T, src=A_power_next_T_psum)
+                elif _scan_i != SOLVE_SCAN_STEPS - 1:
+                    A_power_next_psum = nl.ndarray(
+                        (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                        dtype=nl.float32,
+                        buffer=nl.psum,
+                    )
+                    nisa.nc_matmul(
+                        dst=A_power_next_psum,
+                        stationary=A_power_T,
+                        moving=A_power,
+                    )
+                    A_power_next = nl.ndarray(
+                        (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                        dtype=nl.float32,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_copy(dst=A_power_next, src=A_power_next_psum)
+
+                    A_power_next_T_psum = nl.ndarray(
+                        (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                        dtype=nl.float32,
+                        buffer=nl.psum,
+                    )
+                    nisa.nc_transpose(dst=A_power_next_T_psum, data=A_power_next)
+                    A_power_next_T = nl.ndarray(
+                        (SOLVE_BLOCK_SIZE, SOLVE_BLOCK_SIZE),
+                        dtype=nl.float32,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.tensor_copy(dst=A_power_next_T, src=A_power_next_T_psum)
+
+                    nisa.tensor_copy(dst=A_power, src=A_power_next)
+                    nisa.tensor_copy(dst=A_power_T, src=A_power_next_T)
 
         nisa.tensor_copy(
             dst=v_new[block_start:block_end, 0:dim],
             src=local_v[0:SOLVE_BLOCK_SIZE, 0:dim],
         )
-
 
 @nki.jit
 def deltanet_fused_chunked_fwd(
@@ -829,7 +908,7 @@ def deltanet_fused_chunked_fwd(
         if SOLVE_KKT_HIER:
             _hierarchical_kkt_solve128(v_new, A_T, Imat, solve_rhs, dim)
         else:
-            _blocked_doubling_solve(v_new, A_T, solve_rhs, dim)
+            _blocked_doubling_solve(v_new, A_T, solve_rhs, dim, Imat)
 
         # ============================================================
         # Phase 2: Inter-chunk state propagation
@@ -1277,7 +1356,7 @@ def deltanet_autocp_affine_chunk(
     if SOLVE_KKT_HIER:
         _hierarchical_kkt_solve128(value_u, A_T, Imat, v_beta, dim)
     else:
-        _blocked_doubling_solve(value_u, A_T, v_beta, dim)
+        _blocked_doubling_solve(value_u, A_T, v_beta, dim, Imat)
 
     kb_exp_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(
@@ -1292,7 +1371,7 @@ def deltanet_autocp_affine_chunk(
     if SOLVE_KKT_HIER:
         _hierarchical_kkt_solve128(state_w, A_T, Imat, kb_exp_gc, dim)
     else:
-        _blocked_doubling_solve(state_w, A_T, kb_exp_gc, dim)
+        _blocked_doubling_solve(state_w, A_T, kb_exp_gc, dim, Imat)
 
     q_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=q_T_psum, data=q_norm)
@@ -1707,7 +1786,7 @@ def deltanet_autocp_affine_sequence(
         if SOLVE_KKT_HIER:
             _hierarchical_kkt_solve128(value_u, A_T, Imat, v_beta, dim)
         else:
-            _blocked_doubling_solve(value_u, A_T, v_beta, dim)
+            _blocked_doubling_solve(value_u, A_T, v_beta, dim, Imat)
 
         kb_exp_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
@@ -1722,7 +1801,7 @@ def deltanet_autocp_affine_sequence(
         if SOLVE_KKT_HIER:
             _hierarchical_kkt_solve128(state_w, A_T, Imat, kb_exp_gc, dim)
         else:
-            _blocked_doubling_solve(state_w, A_T, kb_exp_gc, dim)
+            _blocked_doubling_solve(state_w, A_T, kb_exp_gc, dim, Imat)
 
         q_T_psum = nl.ndarray((P_MAX, P_MAX), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=q_T_psum, data=q_norm)
@@ -2142,7 +2221,7 @@ def deltanet_autocp_state_summary_sequence(
             if SOLVE_KKT_HIER:
                 _hierarchical_kkt_solve128(value_u, A_T, Imat, v_beta, dim)
             else:
-                _blocked_doubling_solve(value_u, A_T, v_beta, dim)
+                _blocked_doubling_solve(value_u, A_T, v_beta, dim, Imat)
 
             kb_exp_gc = nl.ndarray((P_MAX, dim), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(
@@ -2157,7 +2236,7 @@ def deltanet_autocp_state_summary_sequence(
             if SOLVE_KKT_HIER:
                 _hierarchical_kkt_solve128(state_w, A_T, Imat, kb_exp_gc, dim)
             else:
-                _blocked_doubling_solve(state_w, A_T, kb_exp_gc, dim)
+                _blocked_doubling_solve(state_w, A_T, kb_exp_gc, dim, Imat)
 
             gl_minus_gc_p = nl.ndarray((P_MAX, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_tensor(
@@ -2887,7 +2966,7 @@ def deltanet_fused_chunked_fwd_multihead(
         if SOLVE_KKT_HIER:
             _hierarchical_kkt_solve128(v_new, A_T, Imat, solve_rhs, dim)
         else:
-            _blocked_doubling_solve(v_new, A_T, solve_rhs, dim)
+            _blocked_doubling_solve(v_new, A_T, solve_rhs, dim, Imat)
 
         q_T_psum = nl.ndarray((P_MAX, CHUNK_SIZE), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_transpose(dst=q_T_psum, data=q_norm[0:CHUNK_SIZE, 0:dim])
