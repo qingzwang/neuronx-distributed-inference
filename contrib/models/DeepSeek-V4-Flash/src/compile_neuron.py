@@ -41,22 +41,24 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CONTRIB_DIR = os.path.abspath(os.path.join(_HERE, ".."))
-_HF_INFERENCE_DIR = "/mnt/nvme/models/DeepSeek-V4-Flash/inference"
 
-for p in (_HERE, _CONTRIB_DIR, _HF_INFERENCE_DIR):
+for p in (_HERE, _CONTRIB_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
+
+import paths  # noqa: E402  — needs _HERE on sys.path first
+
+_HF_INFERENCE_DIR = paths.hf_inference_dir()
+if _HF_INFERENCE_DIR not in sys.path:
+    sys.path.insert(0, _HF_INFERENCE_DIR)
 
 
 # --- Module-level state for the picklable factory + loader ---
 # parallel_model_trace re-imports this module in each spawned rank, so any
 # state we need at factory time has to come from env vars or globals set at
 # module-import time.
-_MODEL_PATH = os.environ.get("DSV4_MODEL_PATH", "/mnt/nvme/models/DeepSeek-V4-Flash")
-_CONFIG_JSON = os.environ.get(
-    "DSV4_CONFIG",
-    "/mnt/nvme/models/DeepSeek-V4-Flash/inference/config.json",
-)
+_MODEL_PATH = paths.model_path()
+_CONFIG_JSON = paths.config_json()
 _N_LAYERS = int(os.environ.get("DSV4_N_LAYERS", "43"))
 _SEQ_LEN = int(os.environ.get("DSV4_SEQ_LEN", "64"))
 _MAX_BATCH_SIZE = int(os.environ.get("DSV4_MAX_BATCH_SIZE", "1"))
@@ -305,7 +307,15 @@ class _TraceWrapper(torch.nn.Module):
 
 
 def _picklable_factory():
-    """Runs in each spawned trace subprocess. Must return (model, aliases)."""
+    """Runs in each spawned trace subprocess. Must return (model, aliases).
+
+    When DSV4_LOAD_WEIGHTS=1 this also loads *this rank's* slice of the real
+    checkpoint before returning. That has to happen here, inside the spawned
+    rank, rather than via NxD's `checkpoint_loader_callable`: NxD's sharding
+    only recognizes its own parallel-layer classes, and HF's model.py defines
+    same-named classes of its own, so NxD would shard nothing. See
+    shard_loader.py for the full explanation.
+    """
     for p in (_HERE, _CONTRIB_DIR, _HF_INFERENCE_DIR):
         if p not in sys.path:
             sys.path.insert(0, p)
@@ -316,33 +326,15 @@ def _picklable_factory():
     torch.set_default_dtype(torch.bfloat16)
     m_args = _build_model_args(hf)
     m = hf.Transformer(m_args).eval()
+
+    if os.environ.get("DSV4_LOAD_WEIGHTS") == "1":
+        import shard_loader
+        # hf.world_size / hf.rank were set from the process group inside
+        # Transformer.__init__, so the model already has rank-local shapes.
+        shard_loader.load_rank_weights(
+            m, _MODEL_PATH, rank=hf.rank, world_size=hf.world_size,
+        )
     return _TraceWrapper(m), {}
-
-
-def _picklable_checkpoint_loader():
-    """Return the full dequantized BF16 state_dict for NxD to shard rank-aware."""
-    for p in (_HERE, _CONTRIB_DIR, _HF_INFERENCE_DIR):
-        if p not in sys.path:
-            sys.path.insert(0, p)
-    from dequant_checkpoint import dequant_shard
-    from glob import glob
-    state = {}
-    for shard in sorted(glob(os.path.join(_MODEL_PATH, "model-*.safetensors"))):
-        deq, _ = dequant_shard(shard, dry_run=False)
-        # Drop `.scale` and drop MTP-layer tensors we don't need
-        for k, v in deq.items():
-            if k.endswith(".scale"):
-                continue
-            if k.startswith("mtp."):
-                continue
-            # Prune tensors for layers beyond _N_LAYERS
-            if k.startswith("layers."):
-                lid = int(k.split(".")[1])
-                if lid >= _N_LAYERS:
-                    continue
-            state[k] = v
-    print(f"[loader] {len(state)} tensors kept for n_layers={_N_LAYERS}", flush=True)
-    return state
 
 
 def _example_inputs():
@@ -364,14 +356,17 @@ def main():
     ap.add_argument("--seq-len", type=int, default=16)
     ap.add_argument("--max-batch-size", type=int, default=1)
     ap.add_argument("--out-dir", default="/tmp/dsv4_smoke")
-    ap.add_argument("--model-path", default="/mnt/nvme/models/DeepSeek-V4-Flash")
-    ap.add_argument("--config",
-                    default="/mnt/nvme/models/DeepSeek-V4-Flash/inference/config.json")
-    ap.add_argument("--spmd", action="store_true",
-                    help="Use SPMD mode: compile one rank then generate the rest "
-                         "via checkpoint_loader_callable. Much faster + lower "
-                         "memory for large models; but the loader dict must be "
-                         "picklable / serializable across process boundaries.")
+    ap.add_argument("--model-path", default=paths.model_path())
+    ap.add_argument("--config", default=paths.config_json())
+    ap.add_argument("--load-weights", action="store_true",
+                    help="Load each rank's slice of the real checkpoint before "
+                         "tracing. Without this the trace runs on a random-init "
+                         "model, which validates the graph but not accuracy. "
+                         "NOTE: SPMD mode (NxD's checkpoint_loader_callable) "
+                         "cannot be used for this model — NxD only shards its "
+                         "own parallel-layer classes and HF's model.py defines "
+                         "its own same-named ones, so nothing gets sharded. "
+                         "See shard_loader.py.")
     args = ap.parse_args()
 
     # Publish factory args via env (spawned subprocesses re-import this module).
@@ -380,6 +375,7 @@ def main():
     os.environ["DSV4_N_LAYERS"] = str(args.n_layers)
     os.environ["DSV4_SEQ_LEN"] = str(args.seq_len)
     os.environ["DSV4_MAX_BATCH_SIZE"] = str(args.max_batch_size)
+    os.environ["DSV4_LOAD_WEIGHTS"] = "1" if args.load_weights else "0"
 
     global _MODEL_PATH, _CONFIG_JSON, _N_LAYERS, _SEQ_LEN, _MAX_BATCH_SIZE
     _MODEL_PATH = args.model_path
@@ -391,7 +387,8 @@ def main():
     from neuronx_distributed.trace import parallel_model_save, parallel_model_trace
 
     os.makedirs(args.out_dir, exist_ok=True)
-    print(f"[compile] tp={args.tp}  n_layers={args.n_layers}  seq_len={args.seq_len}")
+    print(f"[compile] tp={args.tp}  n_layers={args.n_layers}  seq_len={args.seq_len}  "
+          f"weights={'real' if args.load_weights else 'random-init'}")
 
     t0 = time.perf_counter()
     kwargs = dict(
@@ -404,12 +401,6 @@ def main():
             "--enable-mixed-precision-accumulation",
         ],
     )
-    if args.spmd:
-        kwargs.update(
-            spmd_mode=True,
-            inline_weights_to_neff=False,
-            checkpoint_loader_callable=_picklable_checkpoint_loader,
-        )
     parallel_model = parallel_model_trace(
         _picklable_factory,
         _example_inputs(),

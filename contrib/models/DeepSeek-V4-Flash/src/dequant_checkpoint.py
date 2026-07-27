@@ -34,12 +34,16 @@ Usage:
 
 import argparse
 import os
+import sys
 import time
 from glob import glob
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paths  # noqa: E402
 
 
 # FP4 (E2M1) decode table from HF's convert.py. High-bit-1 indicates sign, low 3 bits value.
@@ -228,7 +232,7 @@ def dequant_shard(path: str, dry_run: bool):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="/mnt/nvme/models/DeepSeek-V4-Flash",
+    ap.add_argument("--ckpt", default=paths.model_path(),
                     help="HF checkpoint dir with 46 safetensors shards")
     ap.add_argument("--out-dir", default=None,
                     help="Write dequantized bf16 safetensors here. Default: dry-run.")

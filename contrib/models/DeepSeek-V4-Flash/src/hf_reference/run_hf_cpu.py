@@ -50,8 +50,10 @@ for p in (_SRC_DIR, _CONTRIB_MODEL_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import paths  # noqa: E402  — needs _SRC_DIR on sys.path first
+
 # Path to HF's cloned inference/ dir (comes with the checkpoint download)
-_HF_INFERENCE_DIR = "/mnt/nvme/models/DeepSeek-V4-Flash/inference"
+_HF_INFERENCE_DIR = paths.hf_inference_dir()
 
 
 def _wire_cpu_kernel():
@@ -185,9 +187,8 @@ def load_weights_streaming(model, ckpt_dir: str, limit_shards: int = 0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt-dir", default="/mnt/nvme/models/DeepSeek-V4-Flash")
-    ap.add_argument("--config",
-                    default="/mnt/nvme/models/DeepSeek-V4-Flash/inference/config.json")
+    ap.add_argument("--ckpt-dir", default=paths.model_path())
+    ap.add_argument("--config", default=paths.config_json())
     ap.add_argument("--max-seq-len", type=int, default=64,
                     help="Shrink from 4096 to reduce KV cache RAM in this smoke")
     ap.add_argument("--limit-shards", type=int, default=0,
