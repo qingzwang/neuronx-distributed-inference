@@ -307,6 +307,191 @@ def _patch_hf_model_for_xla(hf_mod):
     hf_mod.apply_rotary_emb = apply_rotary_emb
 
 
+def _patch_index_helpers_for_xla(hf_mod):
+    """Make get_window/compress_topk_idxs build their index tensors on-device.
+
+    Both helpers construct pure position constants with bare `torch.arange`.
+    HF gets away with it because its __main__ sets a global default device of
+    cuda; under XLA tracing the default device is CPU, so the results are CPU
+    tensors. Layers 0-1 tolerate that (compress_ratio == 0, so the window
+    indices go straight into sparse_attn, which accepts a host index), but
+    layer 2 onwards does
+
+        topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+
+    where compress_topk_idxs comes from the Indexer and *is* on device:
+
+        RuntimeError: Expected all tensors in the given list to be XLA
+        tensors. Element at index 0 is not an XLA tensor.
+
+    The device is recorded from input_ids at the top of Transformer.forward
+    because these are free functions with no module to read it from. Also drops
+    HF's lru_cache: the cache key does not include the device, so a cached CPU
+    result would be handed back on a later on-device call.
+    """
+    import torch as _torch
+    import torch.nn.functional as _F
+
+    state = {"device": None}
+
+    def _dev():
+        return state["device"]
+
+    def _rows(vec, n_rows):
+        """Materialize `vec` as n_rows identical rows without a strided view.
+
+        Neither `.repeat(n, 1)` nor `.unsqueeze(0).expand(n, -1)` survives XLA
+        tracing here:
+            RuntimeError: aten::as_strided ... has no implementation for the
+            backend "xla:0". View operators don't support since the tensor's
+            storage cannot be shared across devices.
+        Adding a zero column vector broadcasts to the same result as a real op.
+        """
+        zeros = _torch.zeros(n_rows, 1, dtype=vec.dtype, device=vec.device)
+        return vec.unsqueeze(0) + zeros
+
+    def _batch(matrix, bsz):
+        """Same trick for the leading batch dim."""
+        zeros = _torch.zeros(bsz, *([1] * matrix.dim()),
+                             dtype=matrix.dtype, device=matrix.device)
+        return matrix.unsqueeze(0) + zeros
+
+    def get_window_topk_idxs(window_size, bsz, seqlen, start_pos):
+        d = _dev()
+        if start_pos >= window_size - 1:
+            start_pos %= window_size
+            matrix = _torch.cat([
+                _torch.arange(start_pos + 1, window_size, device=d),
+                _torch.arange(0, start_pos + 1, device=d),
+            ], dim=0)
+        elif start_pos > 0:
+            matrix = _F.pad(_torch.arange(start_pos + 1, device=d),
+                            (0, window_size - start_pos - 1), value=-1)
+        else:
+            base = _torch.arange(seqlen, device=d).unsqueeze(1)
+            matrix = ((base - window_size + 1).clamp(0)
+                      + _torch.arange(min(seqlen, window_size), device=d))
+            matrix = _torch.where(matrix > base, -1, matrix)
+        return _batch(matrix, bsz)
+
+    def get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset):
+        d = _dev()
+        if start_pos > 0:
+            matrix = _torch.arange(0, (start_pos + 1) // ratio, device=d) + offset
+        else:
+            matrix = _rows(_torch.arange(seqlen // ratio, device=d), seqlen)
+            mask = (matrix
+                    >= _torch.arange(1, seqlen + 1, device=d).unsqueeze(1) // ratio)
+            matrix = _torch.where(mask, -1, matrix + offset)
+        return _batch(matrix, bsz)
+
+    original_forward = getattr(hf_mod.Transformer.forward, "__wrapped__",
+                               hf_mod.Transformer.forward)
+
+    def transformer_forward(self, input_ids, start_pos: int = 0):
+        state["device"] = input_ids.device
+        return original_forward(self, input_ids, start_pos)
+
+    hf_mod.get_window_topk_idxs = get_window_topk_idxs
+    hf_mod.get_compress_topk_idxs = get_compress_topk_idxs
+    hf_mod.Transformer.forward = transformer_forward
+    # _TraceWrapper looks for __wrapped__ to bypass @torch.inference_mode();
+    # our replacement is already unwrapped, so point it at itself.
+    transformer_forward.__wrapped__ = transformer_forward
+    return state
+
+
+def _patch_topk_for_xla(hf_mod):
+    """Route Gate / Indexer top-k selection through xla_ops (no HLO `sort`).
+
+    neuronx-cc rejects `sort` on trn2, and torch.topk lowers to it:
+        [NCC_EVRF029] Operation sort is not supported on trn2
+    Layers 0-2 use hash routing and layer 0/1 have no compressor, so a 1-3
+    layer build never hits this; layer 2 (Indexer) and layer 3 (score-based
+    gate) do. See xla_ops.py.
+    """
+    import torch as _torch
+    import torch.nn.functional as _F
+
+    import xla_ops
+
+    def gate_forward_xla(self, x, input_ids=None):
+        scores = hf_mod.linear(x.float(), self.weight.float())
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1)
+        elif self.score_func == "sigmoid":
+            scores = scores.sigmoid()
+        else:
+            scores = _F.softplus(scores).sqrt()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.hash:
+            indices = self.tid2eid[input_ids]
+        else:
+            indices = xla_ops.topk_indices(scores, self.topk)
+        weights = original_scores.gather(1, indices.long())
+        if self.score_func != "softmax":
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+        weights = weights * self.route_scale
+        return weights, indices
+
+    def indexer_forward_xla(self, x, qr, start_pos: int, offset: int):
+        bsz, seqlen, _ = x.size()
+        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+        end_pos = start_pos + seqlen
+        if self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache
+            self.compressor.freqs_cis = self.freqs_cis
+        q = self.wq_b(qr)
+        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        hf_mod.apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = hf_mod.rotate_activation(q)
+        hf_mod.fp4_act_quant(q, hf_mod.fp4_block_size, True)
+        self.compressor(x, start_pos)
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.n_heads ** -0.5
+        )
+        index_score = _torch.einsum(
+            "bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio],
+        )
+        index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+        if hf_mod.world_size > 1:
+            import torch.distributed as _dist
+            _dist.all_reduce(index_score)
+        # HF builds these arange masks with the global default device set to
+        # cuda; under XLA tracing the default device is CPU, so they must be
+        # pinned to the activation's device explicitly or the trace aborts with
+        # "Expected XLA tensor. Got: torch.LongTensor".
+        dev = index_score.device
+        causal_limit = (
+            _torch.arange(1, seqlen + 1, device=dev).unsqueeze(1) // ratio
+        )
+        if start_pos == 0:
+            # Broadcast-add rather than repeat/expand: both lower to
+            # as_strided, which torch-xla does not implement.
+            cols = _torch.arange(seqlen // ratio, device=dev).unsqueeze(0)
+            mask = (cols + _torch.zeros(seqlen, 1, dtype=cols.dtype, device=dev)
+                    >= causal_limit)
+            index_score = index_score + _torch.where(
+                mask, float("-inf"), 0.0,
+            ).to(index_score.dtype)
+        k = min(self.index_topk, end_pos // ratio)
+        topk_idxs = xla_ops.topk_indices_unordered(index_score, k)
+        if start_pos == 0:
+            topk_idxs = _torch.where(
+                topk_idxs >= causal_limit, -1, topk_idxs + offset,
+            )
+        else:
+            topk_idxs = topk_idxs + offset
+        return topk_idxs
+
+    hf_mod.Gate.forward = gate_forward_xla
+    hf_mod.Indexer.forward = indexer_forward_xla
+
+
 def apply_xla_patches(hf_mod):
     """Apply every XLA-safety patch HF's model.py needs, in one call.
 
@@ -316,6 +501,8 @@ def apply_xla_patches(hf_mod):
     _patch_hf_model_for_xla(hf_mod)
     _patch_parallel_embedding_for_xla(hf_mod)
     _patch_moe_forward_for_xla(hf_mod)
+    _patch_topk_for_xla(hf_mod)
+    _patch_index_helpers_for_xla(hf_mod)
 
 
 def _build_model_args(hf_mod):
@@ -334,6 +521,26 @@ def _build_model_args(hf_mod):
         # compress_ratios must also match n_layers (drop trailing entries)
         if "compress_ratios" in cfg and len(cfg["compress_ratios"]) > _N_LAYERS:
             cfg["compress_ratios"] = cfg["compress_ratios"][:_N_LAYERS]
+
+    # A layer with compress_ratio r has seq_len // r compressed KV entries. At
+    # seq_len < r that is zero, and every downstream index tensor is
+    # zero-width, which XLA cannot even construct:
+    #   aten::as_strided ... has no implementation for the backend "xla:0"
+    # Reject it here with an actionable message instead.
+    ratios = [r for r in cfg.get("compress_ratios", []) if r]
+    if ratios:
+        need = max(ratios)
+        if _SEQ_LEN < need:
+            offenders = sorted({r for r in ratios if r > _SEQ_LEN})
+            raise ValueError(
+                f"seq_len={_SEQ_LEN} is too short for compress_ratios "
+                f"{offenders} present in the first {cfg['n_layers']} layers: "
+                f"seq_len // compress_ratio == 0 produces zero-width index "
+                f"tensors, which XLA cannot build. Use --seq-len >= {need}, or "
+                f"--n-layers <= "
+                f"{cfg['compress_ratios'].index(max(offenders))} to stay below "
+                f"the first such layer."
+            )
     return hf_mod.ModelArgs(**cfg)
 
 
