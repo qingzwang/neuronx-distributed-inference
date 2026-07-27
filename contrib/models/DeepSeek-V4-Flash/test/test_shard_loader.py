@@ -98,8 +98,7 @@ def main():
     C._wire_shims()
     paths.add_hf_inference_to_syspath()
     import model as hf
-    C._patch_hf_model_for_xla(hf)
-    C._patch_moe_forward_for_xla(hf)
+    C.apply_xla_patches(hf)
     torch.set_default_dtype(torch.bfloat16)
 
     loaded = {}

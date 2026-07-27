@@ -97,6 +97,55 @@ def _wire_shims():
     sys.modules["fast_hadamard_transform"] = mod
 
 
+def _patch_parallel_embedding_for_xla(hf_mod):
+    """Replace boolean-mask assignment in ParallelEmbedding with torch.where.
+
+    HF's version is:
+
+        mask = (x < start) | (x >= end)
+        x = x - start
+        x[mask] = 0                 # index_put_ with a bool mask
+        y = F.embedding(x, weight)
+        y[mask] = 0                 # ditto
+        dist.all_reduce(y)
+
+    `tensor[bool_mask] = 0` lowers on XLA to a `nonzero()`-driven scatter, and
+    `nonzero` has a *data-dependent* output size. Under torch.jit.trace that
+    size is frozen to whatever the example input produced. parallel_model_trace
+    traces with all-zero input_ids, so rank 0 sees mask.sum() == 0 while every
+    other rank sees mask.sum() == seq_len. At runtime with real token ids the
+    true counts differ from the recorded ones and the indirect DMA walks off the
+    end of the index buffer:
+
+        status=1006 Execution Out-Of-Bounds Memory Access
+        scatter/gather (indirect memory copy via vector DGE) out-of-bound
+        access ... engine=GPSIMD
+
+    torch.where is shape-static and index-free, so the same math compiles to a
+    fixed-size select with no indirect addressing. Semantics are identical:
+    out-of-range ids read row 0 and then get zeroed before the all-reduce.
+    """
+    import torch as _torch
+    import torch.nn.functional as _F
+
+    def parallel_embedding_forward(self, x: _torch.Tensor) -> _torch.Tensor:
+        if hf_mod.world_size > 1:
+            in_range = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+            # Clamp instead of masked-assign: any id outside our shard reads
+            # row 0, whose contribution is discarded right after.
+            local = _torch.where(
+                in_range, x - self.vocab_start_idx, _torch.zeros_like(x),
+            )
+            y = _F.embedding(local, self.weight)
+            y = _torch.where(in_range.unsqueeze(-1), y, _torch.zeros_like(y))
+            import torch.distributed as _dist
+            _dist.all_reduce(y)
+            return y
+        return _F.embedding(x, self.weight)
+
+    hf_mod.ParallelEmbedding.forward = parallel_embedding_forward
+
+
 def _patch_moe_forward_for_xla(hf_mod):
     """Replace HF's dispatch-based MoE.forward with a static-shape one.
 
@@ -258,6 +307,17 @@ def _patch_hf_model_for_xla(hf_mod):
     hf_mod.apply_rotary_emb = apply_rotary_emb
 
 
+def apply_xla_patches(hf_mod):
+    """Apply every XLA-safety patch HF's model.py needs, in one call.
+
+    Call this instead of the individual _patch_* functions so a newly added
+    patch can't be silently missed by one of the test harnesses.
+    """
+    _patch_hf_model_for_xla(hf_mod)
+    _patch_parallel_embedding_for_xla(hf_mod)
+    _patch_moe_forward_for_xla(hf_mod)
+
+
 def _build_model_args(hf_mod):
     """Read inference config, override to BF16 fast-path + small-model overrides."""
     with open(_CONFIG_JSON) as f:
@@ -321,8 +381,7 @@ def _picklable_factory():
             sys.path.insert(0, p)
     _wire_shims()
     import model as hf
-    _patch_hf_model_for_xla(hf)
-    _patch_moe_forward_for_xla(hf)
+    apply_xla_patches(hf)
     torch.set_default_dtype(torch.bfloat16)
     m_args = _build_model_args(hf)
     m = hf.Transformer(m_args).eval()
@@ -367,6 +426,14 @@ def main():
                          "own parallel-layer classes and HF's model.py defines "
                          "its own same-named ones, so nothing gets sharded. "
                          "See shard_loader.py.")
+    ap.add_argument("--opt-level", default="1", choices=["1", "2", "3"],
+                    help="neuronx-cc -O level.")
+    ap.add_argument("--no-mixed-precision-accumulation", action="store_true",
+                    help="Drop --enable-mixed-precision-accumulation. That flag "
+                         "changes how reductions are lowered; useful to toggle "
+                         "when chasing runtime faults.")
+    ap.add_argument("--extra-compiler-args", default="",
+                    help="Space-separated extra neuronx-cc flags.")
     args = ap.parse_args()
 
     # Publish factory args via env (spawned subprocesses re-import this module).
@@ -390,16 +457,21 @@ def main():
     print(f"[compile] tp={args.tp}  n_layers={args.n_layers}  seq_len={args.seq_len}  "
           f"weights={'real' if args.load_weights else 'random-init'}")
 
+    compiler_args = [
+        "--model-type=transformer",
+        "--auto-cast=none",
+        f"-O{args.opt_level}",
+    ]
+    if not args.no_mixed_precision_accumulation:
+        compiler_args.append("--enable-mixed-precision-accumulation")
+    compiler_args += args.extra_compiler_args.split()
+    print(f"[compile] compiler_args={compiler_args}")
+
     t0 = time.perf_counter()
     kwargs = dict(
         tp_degree=args.tp,
         compiler_workdir=f"/tmp/dsv4_ws_tp{args.tp}_L{args.n_layers}_S{args.seq_len}",
-        compiler_args=[
-            "--model-type=transformer",
-            "--auto-cast=none",
-            "-O1",
-            "--enable-mixed-precision-accumulation",
-        ],
+        compiler_args=compiler_args,
     )
     parallel_model = parallel_model_trace(
         _picklable_factory,
