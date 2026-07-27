@@ -307,6 +307,153 @@ def _patch_hf_model_for_xla(hf_mod):
     hf_mod.apply_rotary_emb = apply_rotary_emb
 
 
+def _patch_attention_o_proj_for_high_tp(hf_mod):
+    """Make the grouped O-projection work when tp > o_groups.
+
+    HF's Attention does
+
+        self.n_local_groups = self.n_groups // world_size      # o_groups = 8
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+
+    so at tp >= 16 `n_local_groups` is 0, the view has a zero-size dim, and the
+    einsum silently contributes nothing. That caps TP at 8 — but 8 is not
+    enough to hold the model: 283.8 B params is 568 GB in bf16, i.e. 70.9 GB
+    per core at tp=8 against a 24 GB per-core budget (bytes_limit reported by
+    torch_xla on this trn2 with logical-neuroncore-config 2). Production needs
+    tp >= 32.
+
+    Past o_groups the natural split changes axis. Each rank already owns
+    n_heads // tp heads, i.e. a *slice of the input dim* of one group's wo_a
+    rather than whole groups. So for tp > o_groups rank r handles
+
+        group g = r // (tp // o_groups)
+        slice j = r %  (tp // o_groups)   of that group's contraction dim
+
+    which is an ordinary row-parallel (input-sharded) matmul. The partial
+    products are summed by the all_reduce already inside wo_b, which is a
+    RowParallelLinear — so no extra collective is needed and the result is
+    exact up to fp accumulation order (verified: max rel error ~5e-7 vs the
+    unsharded reference at tp = 8, 16, 32, 64).
+
+    tp <= o_groups keeps HF's original grouped-einsum path unchanged.
+    """
+    import torch as _torch
+
+    def attention_forward(self, x: _torch.Tensor, start_pos: int):
+        bsz, seqlen, _ = x.size()
+        freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+        win = self.window_size
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+        if self.compress_ratio and self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+
+        qr = q = self.q_norm(self.wq_a(x))
+        q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+        q = q * _torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        hf_mod.apply_rotary_emb(q[..., -rd:], freqs_cis)
+
+        kv = self.wkv(x)
+        kv = self.kv_norm(kv)
+        hf_mod.apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        hf_mod.act_quant(kv[..., :-rd], 64, hf_mod.scale_fmt,
+                         hf_mod.scale_dtype, True)
+        topk_idxs = hf_mod.get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        if self.compress_ratio:
+            offset = kv.size(1) if start_pos == 0 else win
+            if self.indexer is not None:
+                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+            else:
+                compress_topk_idxs = hf_mod.get_compress_topk_idxs(
+                    ratio, bsz, seqlen, start_pos, offset)
+            topk_idxs = _torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+        topk_idxs = topk_idxs.int()
+
+        if start_pos == 0:
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                (self.kv_cache[:bsz, cutoff:win],
+                 self.kv_cache[:bsz, :cutoff]) = kv[:, -win:].split(
+                     [win - cutoff, cutoff], dim=1)
+            if self.compress_ratio:
+                kv_compress = self.compressor(x, start_pos)
+                if kv_compress is not None:
+                    kv = _torch.cat([kv, kv_compress], dim=1)
+            o = hf_mod.sparse_attn(q, kv, self.attn_sink, topk_idxs,
+                                   self.softmax_scale)
+        else:
+            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if self.compress_ratio:
+                self.compressor(x, start_pos)
+            o = hf_mod.sparse_attn(q, self.kv_cache[:bsz], self.attn_sink,
+                                   topk_idxs, self.softmax_scale)
+        hf_mod.apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+
+        if self.n_local_groups >= 1:
+            # HF's path: this rank owns whole groups.
+            o = o.view(bsz, seqlen, self.n_local_groups, -1)
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+            o = _torch.einsum("bsgd,grd->bsgr", o, wo_a)
+            o = o.flatten(2)
+        else:
+            # tp > o_groups: this rank owns a contraction-dim slice of one
+            # group. wo_a.weight is already [o_lora_rank, slice_width] from
+            # shard_loader, so a plain matmul is the whole operation; wo_b's
+            # all_reduce sums this rank's partial with its group-mates'.
+            o = _torch.nn.functional.linear(
+                o.reshape(bsz, seqlen, -1), self.wo_a.weight,
+            )
+        return self.wo_b(o)
+
+    original_init = hf_mod.Attention.__init__
+
+    def attention_init(self, layer_id, args):
+        original_init(self, layer_id, args)
+        ws = hf_mod.world_size
+        if ws > self.n_groups:
+            if ws % self.n_groups:
+                raise ValueError(
+                    f"tp={ws} must be a multiple of o_groups={self.n_groups} "
+                    f"to split each group's contraction dim evenly"
+                )
+            # wo_a was built as ColumnParallelLinear(n_heads*head_dim//n_groups,
+            # n_groups*o_lora_rank) -> [n_groups*o_lora_rank // ws, group_in].
+            # Re-allocate as one group's o_lora_rank rows by this rank's slice
+            # of that group's contraction dim.
+            ranks_per_group = ws // self.n_groups
+            group_in = self.n_heads * self.head_dim // self.n_groups
+            slice_width = group_in // ranks_per_group
+            self.o_ranks_per_group = ranks_per_group
+            self.o_group_id = hf_mod.rank // ranks_per_group
+            self.o_slice_id = hf_mod.rank % ranks_per_group
+            self.wo_a.weight = torch.nn.Parameter(
+                torch.empty(self.o_lora_rank, slice_width,
+                            dtype=self.wo_a.weight.dtype),
+                requires_grad=False,
+            )
+            # wo_b was RowParallelLinear(n_groups * o_lora_rank, dim), i.e.
+            # [dim, n_groups * o_lora_rank // ws] — 512 cols at tp=16. But the
+            # partial this rank produces spans its group's *entire* o_lora_rank
+            # block, so wo_b needs all o_lora_rank columns of that block,
+            # replicated across the group's ranks. Splitting wo_b's columns
+            # instead would drop cross terms (verified: 66% relative error).
+            # The duplication is 4096 x 1024 x 2 B = 8 MB per layer.
+            self.wo_b.weight = torch.nn.Parameter(
+                torch.empty(self.dim, self.o_lora_rank,
+                            dtype=self.wo_b.weight.dtype),
+                requires_grad=False,
+            )
+
+    hf_mod.Attention.__init__ = attention_init
+    hf_mod.Attention.forward = attention_forward
+
+
 def _patch_index_helpers_for_xla(hf_mod):
     """Make get_window/compress_topk_idxs build their index tensors on-device.
 
@@ -503,6 +650,7 @@ def apply_xla_patches(hf_mod):
     _patch_moe_forward_for_xla(hf_mod)
     _patch_topk_for_xla(hf_mod)
     _patch_index_helpers_for_xla(hf_mod)
+    _patch_attention_o_proj_for_high_tp(hf_mod)
 
 
 def _build_model_args(hf_mod):

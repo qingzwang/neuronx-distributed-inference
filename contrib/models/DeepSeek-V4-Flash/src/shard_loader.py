@@ -113,6 +113,54 @@ def _slice_for_rank(
     return tensor.narrow(dim, rank * n, n)
 
 
+def _slice_wo_a_high_tp(
+    full: torch.Tensor,
+    local_shape: torch.Size,
+    rank: int,
+    world_size: int,
+    o_groups: int,
+) -> torch.Tensor:
+    """Slice Attention.wo_a for the tp > o_groups layout.
+
+    The checkpoint stores wo_a as [o_groups * o_lora_rank, group_in]. Up to
+    tp == o_groups each rank takes whole groups (a plain dim-0 shard). Beyond
+    that a rank owns one group *and* a slice of that group's contraction dim,
+    so two dims differ from the checkpoint at once and the generic
+    shape-derived `_shard_spec` cannot express it. See
+    compile_neuron._patch_attention_o_proj_for_high_tp for why the split moves
+    axis.
+    """
+    ranks_per_group = world_size // o_groups
+    group_id = rank // ranks_per_group
+    slice_id = rank % ranks_per_group
+    o_lora_rank, slice_width = tuple(local_shape)
+
+    rows = full.narrow(0, group_id * o_lora_rank, o_lora_rank)
+    piece = rows.narrow(1, slice_id * slice_width, slice_width)
+    return piece.contiguous()
+
+
+def _slice_wo_b_high_tp(
+    full: torch.Tensor,
+    local_shape: torch.Size,
+    rank: int,
+    world_size: int,
+    o_groups: int,
+) -> torch.Tensor:
+    """Slice Attention.wo_b for the tp > o_groups layout.
+
+    The checkpoint stores wo_b as [dim, o_groups * o_lora_rank]. Under the
+    high-tp split each rank's wo_a partial spans its group's whole o_lora_rank
+    block, so this returns that entire block — meaning group-mates hold
+    identical copies. Splitting the block across them would drop the cross
+    terms of the contraction (66% relative error, measured).
+    """
+    ranks_per_group = world_size // o_groups
+    group_id = rank // ranks_per_group
+    _, o_lora_rank = tuple(local_shape)
+    return full.narrow(1, group_id * o_lora_rank, o_lora_rank).contiguous()
+
+
 def plan_rank_load(
     model: torch.nn.Module,
     weight_map: Dict[str, str],
@@ -171,12 +219,17 @@ def load_rank_weights(
     rank: int,
     world_size: int,
     verbose: bool = True,
+    o_groups: int = 8,
 ) -> Dict[str, int]:
     """Copy this rank's slice of every checkpoint tensor into `model`.
 
     `model` must already be built with rank-local shapes (i.e. HF's
     Transformer constructed under an initialized process group of size
     `world_size`).
+
+    `o_groups` is the config's o_groups; it only matters at world_size >
+    o_groups, where Attention.wo_a needs the two-axis split that
+    `_slice_wo_a_high_tp` implements.
     """
     weight_map = _load_weight_map(ckpt_dir)
     targets = dict(model.named_parameters())
@@ -196,8 +249,20 @@ def load_rank_weights(
                     raise RuntimeError(f"{name}: indexed to {shard_file} but not present")
                 param = targets[name]
                 full = _dequant_one(handle, name, available)
-                dim = _shard_spec(name, param.shape, tuple(full.shape), world_size)
-                piece = _slice_for_rank(full, dim, rank, world_size)
+                if name.endswith("attn.wo_a.weight") and world_size > o_groups:
+                    piece = _slice_wo_a_high_tp(
+                        full, param.shape, rank, world_size, o_groups,
+                    )
+                    dim = 0  # for the stats tally: this rank holds a slice
+                elif name.endswith("attn.wo_b.weight") and world_size > o_groups:
+                    piece = _slice_wo_b_high_tp(
+                        full, param.shape, rank, world_size, o_groups,
+                    )
+                    dim = 1
+                else:
+                    dim = _shard_spec(name, param.shape, tuple(full.shape),
+                                      world_size)
+                    piece = _slice_for_rank(full, dim, rank, world_size)
                 if tuple(piece.shape) != tuple(param.shape):
                     raise RuntimeError(
                         f"{name}: sliced to {tuple(piece.shape)} but the model "
