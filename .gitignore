@@ -147,3 +147,13 @@ neuronxcc*
 
 # neuronx-cc drops this in the cwd on every trace
 PostSPMDPassesExecutionDuration.txt
+
+# neuronx-cc scratch, dropped into whatever cwd a trace runs from
+*.neff
+*.hlo_module.pb
+*.ntff
+log-neuron-cc.txt
+global_metric_store.json
+neuronxcc-*/
+# per-kernel cache dirs, named by content hash
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
