@@ -789,6 +789,14 @@ def main():
                          "when chasing runtime faults.")
     ap.add_argument("--extra-compiler-args", default="",
                     help="Space-separated extra neuronx-cc flags.")
+    ap.add_argument("--compiler-workdir", default=None,
+                    help="Scratch dir for neuronx-cc. Defaults under /tmp, which "
+                         "is too small at production depth: the workdir holds one "
+                         "HLO + NEFF per rank, so 43 layers at tp=32 needs "
+                         "hundreds of GB. Point this at a big filesystem. Do NOT "
+                         "set TMPDIR to move it — torch's shm_manager needs "
+                         "TMPDIR to already exist and fails the run if it does "
+                         "not.")
     args = ap.parse_args()
 
     # Publish factory args via env (spawned subprocesses re-import this module).
@@ -822,10 +830,16 @@ def main():
     compiler_args += args.extra_compiler_args.split()
     print(f"[compile] compiler_args={compiler_args}")
 
+    workdir = args.compiler_workdir or (
+        f"/tmp/dsv4_ws_tp{args.tp}_L{args.n_layers}_S{args.seq_len}"
+    )
+    os.makedirs(workdir, exist_ok=True)
+    print(f"[compile] compiler_workdir={workdir}")
+
     t0 = time.perf_counter()
     kwargs = dict(
         tp_degree=args.tp,
-        compiler_workdir=f"/tmp/dsv4_ws_tp{args.tp}_L{args.n_layers}_S{args.seq_len}",
+        compiler_workdir=workdir,
         compiler_args=compiler_args,
     )
     parallel_model = parallel_model_trace(
