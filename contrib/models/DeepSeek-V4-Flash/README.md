@@ -1,8 +1,9 @@
 # DeepSeek-V4-Flash on Trainium 2
 
 A port of DeepSeek-V4-Flash (283.8 B params, 43 layers) to AWS Trainium 2 via
-NeuronX Distributed. Prefill works end to end at full depth and produces
-correct output on device; decode is not implemented yet.
+NeuronX Distributed. Prefill works end to end at full depth and produces correct
+output on device. Decode works with a device-resident KV cache — validated at
+5 layers, not yet compiled at full depth.
 
 ## Status
 
@@ -11,8 +12,9 @@ correct output on device; decode is not implemented yet.
 | Compile, all 43 layers at TP=32 | works — 32/32 ranks PASS |
 | Correct output on device | yes, see below |
 | Numerics vs CPU reference | cosine 0.99996+ at 1/4/12 layers, TP=8 and TP=32 |
-| Decode (`start_pos > 0`) | **not implemented** — prefill graph only |
-| Performance | **unusable** — 492 s for one 128-token prefill |
+| Decode (`start_pos > 0`) | works at 5 layers, TP=32: 20 ms/token, cache on device |
+| Decode at 43 layers | not compiled yet |
+| Performance | prefill **unusable** — 492 s for one 128-token prefill |
 | `seq_len > 2048` | unsupported, raises (needs an NKI top-k kernel) |
 
 Device output for `"It is well known that the capital city of France is"`
@@ -65,12 +67,38 @@ Start smaller when iterating: `--n-layers 5 --tp 32` compiles in ~6 min and
 covers every distinct layer type (see below), so almost every bug shows up
 there.
 
+### Decode
+
+```bash
+# --mode decode: one token per call, start_pos a runtime input.
+# --seq-len sets max_seq_len (how far generation can run), not the input width.
+python src/compile_neuron.py --mode decode --tp 32 --n-layers 5 --seq-len 256 \
+    --load-weights --out /mnt/data/artifacts/dsv4_decode_tp32_L5 \
+    --compiler-workdir /mnt/data/tmp/decode_ws
+
+python src/run_neuron.py --mode decode \
+    --artifact /mnt/data/artifacts/dsv4_decode_tp32_L5 \
+    --seq-len 256 --prompt "The capital of France is" --greedy 8
+```
+
+Measured at 5 layers, TP=32: 516 s to compile, 79 GB artifact, **20 ms/token**
+against 7.4 s/token for the same work through the prefill graph.
+
+Decode ingests the prompt one token at a time rather than inheriting prefill's
+cache. Prefill and decode are separate traced artifacts with separate device
+buffers, and NxD offers no way to hand one graph's aliased state to another. The
+numbers are the same either way (`test_decode_vs_reference.py --no-prefill`
+checks exactly this), it just costs `prompt_len` cheap calls instead of one big
+one.
+
 ## Layout
 
 ```
 src/
   paths.py             checkpoint path resolution (DSV4_MODEL_PATH)
   compile_neuron.py    the port: XLA patches + parallel_model_trace driver
+  decode_patches.py    the decode path: tensor start_pos + aliased KV state
+  run_neuron.py        device inference, --mode prefill | decode
   shard_loader.py      rank-aware weight loading and sharding
   xla_ops.py           trn2-safe replacements for unsupported ops
   dequant_checkpoint.py  FP4/FP8 -> bf16
@@ -80,6 +108,8 @@ test/
   test_shard_loader.py   sharding round-trip
   test_high_tp_o_proj.py TP > o_groups O-projection vs TP=1
   test_neuron_vs_cpu.py  device logits vs CPU, same weights
+  test_decode_vs_reference.py   decode rewrite vs HF's decode, on CPU
+  test_decode_neuron_vs_cpu.py  device decode vs CPU, incl. the aliased caches
   test/spike/            exploratory scripts kept for reference
 ```
 
@@ -125,6 +155,60 @@ this model: `trace.shard_children()` early-returns unless a module is an
 `isinstance` of NxD's own parallel classes, and HF's `model.py` declares its
 *own* classes with the same names. NxD matches none of them and shards nothing,
 **silently**. See the header of `shard_loader.py`.
+
+## What decode had to change, and why
+
+Prefill can bake `start_pos = 0` into the trace. Decode cannot: a graph per
+position is not an option, so every Python-int use of `start_pos` becomes a
+tensor op. These live in `src/decode_patches.py`, on top of the XLA patches.
+
+**Variable-length index lists become fixed-length with `-1` padding.** HF's
+`get_compress_topk_idxs` returns `arange(0, (p+1) // ratio)`, whose *length*
+depends on the position — impossible in a graph. Emit all `max_comp` entries and
+mark the unwritten tail `-1`, which `sparse_attn` already treats as masked.
+
+**HF's three-way window branch collapses to one expression.** Ring slot `j`
+holds absolute position `p - ((p - j) mod win)`, which is real iff `j <= p`, so
+`where(arange(win) <= p, arange(win), -1)` covers every case. For `p >= win-1`
+this is a *permutation* of what HF emits, not the same order — which is fine
+only because `sparse_attn` gathers the listed slots and softmaxes over them, so
+just the set and the mask matter. Verified against both HF branches for
+`p = 1..19`.
+
+**Early returns become masked writes.** `Compressor.forward` returns early when
+`(p+1) % ratio != 0`. An early return changes the graph, so instead always
+compute and always write, but write back `where(should, new, old)`.
+
+**State must be `nn.Parameter`, not `register_buffer`.** This is the trap that
+cost the most. NxD resolves output aliases by scanning `named_parameters()` and
+matching `.data_ptr()` (`torch_neuronx/xla_impl/hlo_conversion.py`). Buffers are
+never scanned, so a buffer key matches nothing and the alias is **silently
+dropped** — the graph still compiles and runs, and resets its cache every call,
+which reads as a model that forgot its context rather than as a config error.
+
+**Alias keys must stay CPU tensors.** NxD pickles the alias dict back to the
+parent, which does `initial_states = tuple(aliases.keys())` and rebuilds each
+key. An XLA tensor key makes that `nrt_init` a device the parent does not own:
+`[NRT_FAILURE] status_code=1`, then `BrokenProcessPool`. Note `.cpu()` on a CPU
+tensor returns *self*, so it does not undo a `module._apply()` that already
+moved the tensor — the state has to be a Parameter from the start.
+
+**`index_copy` demands a Long index on XLA.** `start_pos` arrives as int32
+because that is what `torch.jit.trace` takes as a scalar input:
+`Check failed: index->dtype() == at::ScalarType::Long (Int vs. Long)`.
+
+**HF's view aliasing has to become an explicit redirect.** HF does
+`self.compressor.kv_cache = self.kv_cache[:, win:]`, so a compressor write lands
+in the enclosing layer's cache. `index_copy` returns a new tensor rather than
+mutating, so a write through the view would be invisible to the owner.
+`StateSink` replaces the view with an owner/offset redirect and splices writes
+back.
+
+**`freqs_cis` must be wired per forward, not at patch time.** Only `Attention`
+registers it as a buffer; `Compressor` and `Indexer` initialise theirs to `None`
+and HF fills them in on the first `Attention.forward`. Since `_apply` moves
+buffers but not plain attributes, wiring before the model reaches the device
+would pin the CPU copy into the graph as a constant.
 
 ## Two traps worth knowing before you touch this
 
@@ -175,13 +259,11 @@ every combination of them with the two gate types appears within the first 5.
 
 ## Known gaps
 
-1. **Decode is missing.** `_TraceWrapper` bakes `start_pos` in via `.item()`,
-   so only the prefill graph exists. This is not just a tracing detail:
-   `Compressor.forward` early-returns when `(start_pos + 1) % ratio != 0`, and
-   `get_window_topk_idxs` branches three ways on `start_pos`, so one graph
-   cannot cover every decode position. It needs either `ratio`-many graphs or a
-   rewrite to compute-then-select, plus real KV-cache state carried across
-   invocations.
+1. **Decode is only validated at 5 layers.** The graph and its numerics are
+   settled (see above), but it has not been compiled at 43 layers, and the
+   prompt-ingest path is `prompt_len` separate calls rather than a chunked
+   prefill. Batch > 1 is untraced. There is also no stopping criterion,
+   sampling, or MTP head — `run_neuron.py --mode decode` is greedy only.
 2. **Performance.** One 128-token prefill takes 492 s. The static-shape MoE
    patch computes all experts and masks, doing ~42.7x the ideal FLOPs
    (2.22 TFLOP/rank/token-batch at 43 layers, TP=32). Fixing this means NxDI's

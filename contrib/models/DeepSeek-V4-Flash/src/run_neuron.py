@@ -23,16 +23,30 @@ token. `--greedy N` extends this by feeding the prediction back in, which is
 where a subtly wrong graph shows up as text that degenerates after a token or
 two.
 
-Note this uses the prefill graph only. `start_pos` is baked into the trace, so
-each greedy step re-runs the whole prompt (O(n^2) and capped at seq_len) rather
-than using the KV cache. Correct, just not how you would serve it. See the
-decode task for the real token-generation graph.
+Two graph kinds, selected with --mode:
+
+  prefill  `start_pos` is baked into the trace, so each greedy step re-runs the
+           whole prompt (O(n^2), capped at seq_len) with the window sliding.
+           Correct, but not how you would serve it.
+  decode   one token per call with `start_pos` a runtime input and the KV cache
+           aliased on device, so each step is O(1). The prompt is fed through
+           the same graph one token at a time.
+
+Why decode does not consume prefill's cache: they are separate traced artifacts
+with separate device buffers, and NxD gives no way to hand one graph's aliased
+state to another. So decode mode ingests the prompt through its own graph,
+position by position. That costs prompt_len calls instead of one, but each is
+cheap and the numbers match one-shot prefill (test_decode_vs_reference.py
+--no-prefill).
 
 Run:
     source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
     cd contrib/models/DeepSeek-V4-Flash
     python src/run_neuron.py --artifact /mnt/data/artifacts/dsv4_tp32_L43 \
         --seq-len 128 --prompt "The capital of France is" --greedy 8
+    python src/run_neuron.py --mode decode \
+        --artifact /mnt/data/artifacts/dsv4_decode_tp32_L5 \
+        --seq-len 256 --prompt "The capital of France is" --greedy 8
 """
 
 import argparse
@@ -83,8 +97,14 @@ def describe_logits(logits):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--artifact", required=True, help="dir with tp_*.pt")
+    ap.add_argument("--mode", choices=["prefill", "decode"], default="prefill",
+                    help="Must match how the artifact was compiled. prefill "
+                         "takes the whole prompt per call; decode takes one "
+                         "token and a runtime start_pos.")
     ap.add_argument("--seq-len", type=int, required=True,
-                    help="Must match the compiled graph's seq_len.")
+                    help="prefill: must equal the compiled graph's seq_len, and "
+                         "the prompt must fill it exactly. decode: the compiled "
+                         "max_seq_len, i.e. how far generation can run.")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--prompt", default="The capital of France is")
     ap.add_argument("--prompt-ids", default=None,
@@ -113,7 +133,19 @@ def main():
     else:
         raise SystemExit("no tokenizer available; pass --prompt-ids")
 
-    if args.fill and tok is not None and len(ids) < args.seq_len:
+    # The prompt-must-fill-the-window rule is a prefill constraint: the graph's
+    # input shape is static and the head reads only the last position. Decode
+    # takes one token at a time with an explicit position, so any prompt shorter
+    # than max_seq_len is fine and no filler is needed.
+    if args.mode == "decode":
+        if len(ids) + max(0, args.greedy) > args.seq_len:
+            raise SystemExit(
+                f"prompt ({len(ids)}) + greedy ({args.greedy}) exceeds the "
+                f"compiled max_seq_len ({args.seq_len}). The KV cache and the "
+                f"RoPE table are both sized to it, so generation cannot run "
+                f"past it; compile with a larger --seq-len."
+            )
+    elif args.fill and tok is not None and len(ids) < args.seq_len:
         filler = tok.encode(args.fill).ids
         if not filler:
             raise SystemExit("--fill encoded to zero tokens")
@@ -123,7 +155,7 @@ def main():
         print(f"[input] left-filled to {len(ids)} tokens; the last "
               f"{args.seq_len - need} are the prompt")
 
-    if len(ids) != args.seq_len:
+    if args.mode == "prefill" and len(ids) != args.seq_len:
         raise SystemExit(
             f"prompt is {len(ids)} tokens but the graph is compiled for "
             f"seq_len={args.seq_len}. This model's head emits only the last "
@@ -138,6 +170,25 @@ def main():
     t0 = time.perf_counter()
     model = parallel_model_load(args.artifact)
     print(f"[neuron] loaded in {time.perf_counter() - t0:.1f}s")
+
+    def forward_decode(token, pos):
+        """One decode step: a single token at absolute position `pos`.
+
+        The KV cache lives on the device and is aliased to the graph's extra
+        outputs, so this call also *updates* it — the state is implicit, and
+        calling out of order or replaying a position corrupts it. Hence the
+        strictly increasing `pos` in the loops below.
+
+        The graph returns (logits, *states); the states are only there for the
+        aliasing machinery, so take output 0.
+        """
+        inp = torch.tensor([[token]] * args.batch, dtype=torch.long)
+        out = model(inp, torch.tensor(pos, dtype=torch.int32))
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        if out.dim() == 3:
+            out = out[:, -1, :]
+        return out
 
     def forward(token_ids):
         """Run the prompt. Its length MUST equal the graph's seq_len.
@@ -173,6 +224,64 @@ def main():
             out = out[:, -1, :]
         return out
 
+    def report_first(logits, dt):
+        """Reference-free sanity checks, printed for the first step only."""
+        row = logits[0].float()
+        stats = describe_logits(row)
+        print(f"\n[neuron] forward in {dt:.1f}s  shape={list(logits.shape)}")
+        print(f"  NaN={stats['nan']}  Inf={stats['inf']}")
+        print(f"  logits: min={stats['min']:.3f} max={stats['max']:.3f} "
+              f"mean={stats['mean']:.3f} std={stats['std']:.3f}")
+        print(f"  softmax: entropy={stats['entropy']:.3f} "
+              f"top1_prob={stats['top1_prob']:.4f}")
+        topv, topi = row.topk(args.top_k)
+        print(f"  top-{args.top_k}:")
+        for v, i in zip(topv.tolist(), topi.tolist()):
+            piece = tok.decode([i]) if tok else ""
+            print(f"    {i:>7}  {v:8.3f}  {piece!r}")
+        if stats["nan"] or stats["inf"]:
+            raise SystemExit("[FAIL] non-finite logits")
+        if stats["std"] < 1e-3:
+            raise SystemExit("[FAIL] logits collapsed to a constant")
+
+    if args.mode == "decode":
+        # Ingest the prompt one token at a time, building up the device-resident
+        # cache. Only the last of these logits is a prediction we want: the
+        # earlier ones predict tokens the prompt already supplies.
+        print(f"\n[neuron] ingesting {len(ids)} prompt tokens ...")
+        t0 = time.perf_counter()
+        for p, tid in enumerate(ids):
+            logits = forward_decode(tid, p)
+        prefill_dt = time.perf_counter() - t0
+        print(f"[neuron] prompt ingested in {prefill_dt:.1f}s "
+              f"({prefill_dt / len(ids) * 1000:.0f} ms/token)")
+        report_first(logits, prefill_dt / len(ids))
+
+        generated = []
+        pos = len(ids)
+        for step in range(max(1, args.greedy)):
+            nxt = int(logits[0].float().argmax())
+            generated.append(nxt)
+            if args.greedy:
+                piece = tok.decode([nxt]) if tok else str(nxt)
+                print(f"  step {step + 1}: {nxt} {piece!r}")
+            if step + 1 >= max(1, args.greedy):
+                break
+            # Feed the prediction back in at the next position; the cache
+            # already holds everything before it.
+            t0 = time.perf_counter()
+            logits = forward_decode(nxt, pos)
+            dt = time.perf_counter() - t0
+            print(f"           ({dt * 1000:.0f} ms)")
+            pos += 1
+
+        if args.greedy and tok is not None:
+            print(f"\n[prompt]     {tok.decode(ids)!r}")
+            print(f"[generated]  {tok.decode(generated)!r}")
+            print(f"[full]       {tok.decode(ids + generated)!r}")
+        print("\n[ok] device inference completed")
+        return
+
     generated = []
     window = list(ids)
     for step in range(max(1, args.greedy)):
@@ -181,25 +290,9 @@ def main():
         dt = time.perf_counter() - t0
 
         row = logits[0].float()
-        stats = describe_logits(row)
         nxt = int(row.argmax())
-
         if step == 0:
-            print(f"\n[neuron] forward in {dt:.1f}s  shape={list(logits.shape)}")
-            print(f"  NaN={stats['nan']}  Inf={stats['inf']}")
-            print(f"  logits: min={stats['min']:.3f} max={stats['max']:.3f} "
-                  f"mean={stats['mean']:.3f} std={stats['std']:.3f}")
-            print(f"  softmax: entropy={stats['entropy']:.3f} "
-                  f"top1_prob={stats['top1_prob']:.4f}")
-            topv, topi = row.topk(args.top_k)
-            print(f"  top-{args.top_k}:")
-            for v, i in zip(topv.tolist(), topi.tolist()):
-                piece = tok.decode([i]) if tok else ""
-                print(f"    {i:>7}  {v:8.3f}  {piece!r}")
-            if stats["nan"] or stats["inf"]:
-                raise SystemExit("[FAIL] non-finite logits")
-            if stats["std"] < 1e-3:
-                raise SystemExit("[FAIL] logits collapsed to a constant")
+            report_first(logits, dt)
 
         generated.append(nxt)
         # Slide the window: the graph's input shape is fixed, so appending the

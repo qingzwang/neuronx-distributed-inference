@@ -62,6 +62,9 @@ _CONFIG_JSON = paths.config_json()
 _N_LAYERS = int(os.environ.get("DSV4_N_LAYERS", "43"))
 _SEQ_LEN = int(os.environ.get("DSV4_SEQ_LEN", "64"))
 _MAX_BATCH_SIZE = int(os.environ.get("DSV4_MAX_BATCH_SIZE", "1"))
+# "prefill" bakes start_pos=0 into the graph; "decode" keeps it a runtime tensor
+# and aliases the KV cache so it persists on device between calls.
+_MODE = os.environ.get("DSV4_MODE", "prefill")
 
 
 def _wire_shims():
@@ -692,6 +695,50 @@ def _build_model_args(hf_mod):
     return hf_mod.ModelArgs(**cfg)
 
 
+class _DecodeTraceWrapper(torch.nn.Module):
+    """Wrap the HF Transformer for a *decode* trace: one token, runtime position.
+
+    Differs from _TraceWrapper in the one way that matters: `start_pos` stays a
+    tensor instead of being `.item()`-ed into the graph. That is the whole point
+    — a decode graph must serve every position, and baking the position in would
+    need one NEFF per step.
+
+    Returns (logits, *states). The extra outputs are what NxD aliases back over
+    the state Parameters, which is how the KV cache survives on device between
+    calls; see decode_patches.collect_state_aliases.
+    """
+
+    def __init__(self, inner, decode_state, sink_builder, states):
+        super().__init__()
+        self.inner = inner
+        self._decode_state = decode_state
+        self._sink_builder = sink_builder
+        self._states = states
+
+    def forward(self, input_ids: torch.Tensor, start_pos: torch.Tensor):
+        import decode_patches
+
+        with torch.no_grad():
+            pos = start_pos.reshape(())
+            sink = self._sink_builder()
+            self._decode_state["pos"] = pos
+            self._decode_state["sink"] = sink
+
+            raw = getattr(self.inner.forward, "__wrapped__", None)
+            fn = (lambda *a: raw(self.inner, *a)) if raw else self.inner.forward
+            # HF's Transformer.forward still takes an int-ish start_pos and
+            # passes it down; the patched Attention ignores it and reads the
+            # tensor from _decode_state, so what we hand over here is unused.
+            logits = fn(input_ids, pos)
+
+            # Order must match collect_state_aliases: output i+1 aliases
+            # states[i].
+            outs = [logits]
+            for mod, name in self._states:
+                outs.append(sink.get(mod, name))
+            return tuple(outs)
+
+
 class _TraceWrapper(torch.nn.Module):
     """Wrap the HF Transformer for XLA tracing.
 
@@ -748,6 +795,22 @@ def _picklable_factory():
         shard_loader.load_rank_weights(
             m, _MODEL_PATH, rank=hf.rank, world_size=hf.world_size,
         )
+
+    if _MODE == "decode":
+        # Decode mode replaces Attention/Compressor/Indexer forwards on top of
+        # the XLA patches (which stay: RoPE, MoE, embedding, top-k are all
+        # position-independent), then promotes the KV state to Parameters so NxD
+        # can alias it across calls.
+        import decode_patches
+        decode_state = decode_patches.apply_decode_patches(hf)
+        slots, aliases = decode_patches.collect_state_aliases(
+            m, n_real_outputs=1,
+        )
+        wrapper = _DecodeTraceWrapper(
+            m, decode_state, lambda: decode_patches.build_sink(m, hf), slots,
+        )
+        return wrapper, aliases
+
     return _TraceWrapper(m), {}
 
 
@@ -757,7 +820,15 @@ def _example_inputs():
     HF's Transformer.forward takes `start_pos: int`; _TraceWrapper accepts
     a scalar tensor and passes .item() through. torch.jit.trace refuses
     Python-int inputs in the example-inputs tuple, so we wrap in a tensor.
+
+    In decode mode S is 1 (one token per step) and start_pos stays a tensor all
+    the way into the graph. The example value is 1, not 0: tracing at 0 would
+    exercise the prefill-shaped branch of any `pos`-derived mask that happens to
+    be degenerate there, and decode is only ever entered at pos >= 1.
     """
+    if _MODE == "decode":
+        ids = torch.zeros(_MAX_BATCH_SIZE, 1, dtype=torch.long)
+        return (ids, torch.ones((), dtype=torch.int32))
     ids = torch.zeros(_MAX_BATCH_SIZE, _SEQ_LEN, dtype=torch.long)
     start_pos = torch.zeros((), dtype=torch.int32)
     return (ids, start_pos)
@@ -924,6 +995,13 @@ def main():
                          "set TMPDIR to move it — torch's shm_manager needs "
                          "TMPDIR to already exist and fails the run if it does "
                          "not.")
+    ap.add_argument("--mode", default="prefill", choices=["prefill", "decode"],
+                    help="prefill: one graph over the whole prompt, start_pos "
+                         "baked to 0. decode: one token per call with start_pos "
+                         "as a runtime input, and the KV cache aliased so it "
+                         "persists on device between calls. --seq-len still sets "
+                         "max_seq_len (how far decode can run) in decode mode; "
+                         "the input is always 1 token wide.")
     args = ap.parse_args()
 
     # Publish factory args via env (spawned subprocesses re-import this module).
@@ -933,19 +1011,25 @@ def main():
     os.environ["DSV4_SEQ_LEN"] = str(args.seq_len)
     os.environ["DSV4_MAX_BATCH_SIZE"] = str(args.max_batch_size)
     os.environ["DSV4_LOAD_WEIGHTS"] = "1" if args.load_weights else "0"
+    os.environ["DSV4_MODE"] = args.mode
 
-    global _MODEL_PATH, _CONFIG_JSON, _N_LAYERS, _SEQ_LEN, _MAX_BATCH_SIZE
+    global _MODEL_PATH, _CONFIG_JSON, _N_LAYERS, _SEQ_LEN, _MAX_BATCH_SIZE, _MODE
     _MODEL_PATH = args.model_path
     _CONFIG_JSON = args.config
     _N_LAYERS = args.n_layers
     _SEQ_LEN = args.seq_len
     _MAX_BATCH_SIZE = args.max_batch_size
+    _MODE = args.mode
 
     from neuronx_distributed.trace import parallel_model_save, parallel_model_trace
 
     os.makedirs(args.out_dir, exist_ok=True)
-    print(f"[compile] tp={args.tp}  n_layers={args.n_layers}  seq_len={args.seq_len}  "
+    print(f"[compile] mode={args.mode}  tp={args.tp}  n_layers={args.n_layers}  "
+          f"seq_len={args.seq_len}  "
           f"weights={'real' if args.load_weights else 'random-init'}")
+    if args.mode == "decode":
+        print("[compile] decode: input is 1 token, start_pos is a runtime "
+              f"input, KV cache aliased on device (max_seq_len={args.seq_len})")
 
     compiler_args = [
         "--model-type=transformer",
