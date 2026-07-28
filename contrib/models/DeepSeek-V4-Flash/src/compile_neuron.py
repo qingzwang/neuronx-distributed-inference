@@ -763,6 +763,90 @@ def _example_inputs():
     return (ids, start_pos)
 
 
+# Host RAM per concurrently-compiling rank, GB. Measured: 12 layers at tp=32
+# peaked at 1465 GB used with 148 GB of that in resident rank weights, so
+# 1317/32 ~= 41. Each rank's neuronx-cc fans out to ~3 OS processes.
+_COMPILE_GB_PER_RANK = 41.0
+
+# Total parameter count of the DeepSeek-V4-Flash checkpoint, all 43 layers.
+_TOTAL_PARAMS = 283.8e9
+
+
+def _host_ram_gb():
+    """(total, available) host RAM in GB, read from /proc/meminfo."""
+    vals = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, _, rest = line.partition(":")
+            vals[k] = int(rest.split()[0]) / (1024 ** 2)  # kB -> GB
+    return vals["MemTotal"], vals["MemAvailable"]
+
+
+def _swap_gb():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("SwapTotal:"):
+                return int(line.split()[1]) / (1024 ** 2)
+    return 0.0
+
+
+def preflight_host_ram(cfg, n_layers, tp, max_parallel_compilations, force=False):
+    """Refuse to start a trace whose host-RAM peak exceeds what the box has.
+
+    `parallel_model_trace` spawns all `tp` ranks at once and holds every rank
+    model resident in host RAM *while* neuronx-cc runs. Two costs add up:
+
+      weights   n_layers/total_layers * total_params * 2 bytes  (bf16, summed
+                over all ranks == the whole model, since the ranks partition it)
+      compiler  _COMPILE_GB_PER_RANK per concurrently-compiling rank. Note that
+                is per *rank*, not per process: max_parallel_compilations gates
+                ranks, and each rank's neuronx-cc fans out to ~3 processes
+                (tp=32 uncapped showed 97 of them).
+
+    The compiler constant is calibrated against a measured run rather than
+    guessed: 12 layers at tp=32 peaked at 1465 GB used with 148 GB of weights,
+    leaving ~1317 GB across 32 concurrent ranks.
+
+    This is not a theoretical guard. A 43-layer tp=32 run needs ~529 GB of
+    weights, and 529 + 32*41 = 1841 GB exceeded the 1999 GB box. With swap=0
+    the kernel livelocked rather than OOM-killing anything: it became
+    unreachable over SSH and had to be power-cycled, losing 45 minutes of
+    weight loading. The 12-layer run fit at 1465 GB and looked like it had
+    headroom, which is exactly why this check has to be arithmetic rather than
+    "the last one fit".
+    """
+    total_layers = int(cfg.get("n_layers", n_layers)) or n_layers
+    weights_gb = (n_layers / total_layers) * _TOTAL_PARAMS * 2 / (1024 ** 3)
+    compilers = min(max_parallel_compilations or tp, tp)
+    compiler_gb = _COMPILE_GB_PER_RANK * compilers
+    need = weights_gb + compiler_gb
+
+    total, avail = _host_ram_gb()
+    swap = _swap_gb()
+    print(f"[preflight] host RAM: total={total:.0f} GB available={avail:.0f} GB "
+          f"swap={swap:.0f} GB")
+    print(f"[preflight] estimated peak: weights={weights_gb:.0f} GB "
+          f"+ {compilers} concurrent ranks x {_COMPILE_GB_PER_RANK:.0f} GB "
+          f"= {compiler_gb:.0f} GB  =>  {need:.0f} GB")
+
+    if need > avail * 0.9:
+        msg = (
+            f"estimated peak host RAM {need:.0f} GB exceeds 90% of available "
+            f"{avail:.0f} GB. With swap={swap:.0f} GB the kernel cannot reclaim, "
+            f"so overcommitting hangs the machine instead of failing the run.\n"
+            f"Options:\n"
+            f"  --max-parallel-compilations N   (N x {_COMPILE_GB_PER_RANK:.0f} GB; "
+            f"N <= {max(0, int((avail * 0.9 - weights_gb) // _COMPILE_GB_PER_RANK))} "
+            f"fits alongside the weights)\n"
+            f"  --n-layers <fewer>              (weights scale linearly)\n"
+            f"  --force                         (proceed anyway; may hang the host)"
+        )
+        if not force:
+            raise SystemExit(f"[preflight] REFUSING TO START: {msg}")
+        print(f"[preflight] WARNING (--force): {msg}")
+    return need
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tp", type=int, default=2)
@@ -789,6 +873,15 @@ def main():
                          "when chasing runtime faults.")
     ap.add_argument("--extra-compiler-args", default="",
                     help="Space-separated extra neuronx-cc flags.")
+    ap.add_argument("--max-parallel-compilations", type=int, default=None,
+                    help="Cap concurrent neuronx-cc processes. Default (None) "
+                         "lets NxD run one per rank, which at tp=32 measured "
+                         "~1.3 TB of host RAM on top of the resident rank "
+                         "models. Trades wall-clock for RAM.")
+    ap.add_argument("--force", action="store_true",
+                    help="Skip the host-RAM preflight refusal. Overcommitting "
+                         "on a swapless host hangs the machine rather than "
+                         "failing the run.")
     ap.add_argument("--compiler-workdir", default=None,
                     help="Scratch dir for neuronx-cc. Defaults under /tmp, which "
                          "is too small at production depth: the workdir holds one "
@@ -830,6 +923,10 @@ def main():
     compiler_args += args.extra_compiler_args.split()
     print(f"[compile] compiler_args={compiler_args}")
 
+    with open(args.config) as f:
+        preflight_host_ram(json.load(f), args.n_layers, args.tp,
+                           args.max_parallel_compilations, force=args.force)
+
     workdir = args.compiler_workdir or (
         f"/tmp/dsv4_ws_tp{args.tp}_L{args.n_layers}_S{args.seq_len}"
     )
@@ -842,6 +939,8 @@ def main():
         compiler_workdir=workdir,
         compiler_args=compiler_args,
     )
+    if args.max_parallel_compilations is not None:
+        kwargs["max_parallel_compilations"] = args.max_parallel_compilations
     parallel_model = parallel_model_trace(
         _picklable_factory,
         _example_inputs(),
