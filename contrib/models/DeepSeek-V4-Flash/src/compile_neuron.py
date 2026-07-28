@@ -763,10 +763,22 @@ def _example_inputs():
     return (ids, start_pos)
 
 
-# Host RAM per concurrently-compiling rank, GB. Measured: 12 layers at tp=32
-# peaked at 1465 GB used with 148 GB of that in resident rank weights, so
-# 1317/32 ~= 41. Each rank's neuronx-cc fans out to ~3 OS processes.
-_COMPILE_GB_PER_RANK = 41.0
+# Host RAM per concurrently-compiling rank, GB, WITH inline_weights_to_neff=True.
+# Measured: 12 layers at tp=32 peaked at 1465 GB used with 148 GB of that in
+# resident rank weights, so 1317/32 ~= 41. Each rank's neuronx-cc fans out to
+# ~3 OS processes. Most of this is the inlined weights being materialized and
+# copied as HLO constants, so it scales with per-rank weight size.
+_COMPILE_GB_PER_RANK_INLINED = 41.0
+
+# Same, with inline_weights_to_neff=False: the weights never enter the HLO, so
+# the compiler only holds the graph and activations. Measured: 4 layers at
+# tp=32 peaked at 187 GB used with 49 GB of resident rank weights, so
+# 138/32 ~= 4.3. Rounded up to 6 for headroom, since this term also has to
+# cover activations that grow with seq_len. For contrast the same shape with
+# inlining on needed ~41 GB/rank, and the compiler workdir went from 336 GB
+# (12 layers, inlined) to 240 MB (4 layers, separated) — the HLO carries the
+# weights when inlined, and that is what makes it expensive.
+_COMPILE_GB_PER_RANK_SEPARATE = 6.0
 
 # Total parameter count of the DeepSeek-V4-Flash checkpoint, all 43 layers.
 _TOTAL_PARAMS = 283.8e9
@@ -790,54 +802,69 @@ def _swap_gb():
     return 0.0
 
 
-def preflight_host_ram(cfg, n_layers, tp, max_parallel_compilations, force=False):
+def preflight_host_ram(cfg, n_layers, tp, max_parallel_compilations,
+                       inline_weights=False, force=False):
     """Refuse to start a trace whose host-RAM peak exceeds what the box has.
 
-    `parallel_model_trace` spawns all `tp` ranks at once and holds every rank
-    model resident in host RAM *while* neuronx-cc runs. Two costs add up:
+    In non-SPMD mode `parallel_model_trace` spawns all `tp` ranks at once and
+    holds every rank model resident in host RAM while neuronx-cc runs. NxD's
+    own log says so: "Tracing in non SPMD mode for large models can run into
+    OOM errors as we compile all ranks". Two costs add up:
 
       weights   n_layers/total_layers * total_params * 2 bytes  (bf16, summed
                 over all ranks == the whole model, since the ranks partition it)
-      compiler  _COMPILE_GB_PER_RANK per concurrently-compiling rank. Note that
-                is per *rank*, not per process: max_parallel_compilations gates
-                ranks, and each rank's neuronx-cc fans out to ~3 processes
-                (tp=32 uncapped showed 97 of them).
+      compiler  per concurrently-compiling rank. Note that is per *rank*, not
+                per process: max_parallel_compilations gates ranks, and each
+                rank's neuronx-cc fans out to ~3 processes (tp=32 uncapped
+                showed 97 of them).
 
-    The compiler constant is calibrated against a measured run rather than
-    guessed: 12 layers at tp=32 peaked at 1465 GB used with 148 GB of weights,
-    leaving ~1317 GB across 32 concurrent ranks.
+    The compiler term depends heavily on `inline_weights`. With
+    inline_weights_to_neff=True (NxD's default, which is what we used) every
+    weight becomes an HLO constant that the compiler materializes and copies,
+    so the term is dominated by weight size: measured 41 GB/rank. NxDI's own
+    production path passes inline_weights_to_neff=False (see
+    neuronx_distributed_inference/models/model_wrapper.py) precisely to avoid
+    that, which is why much larger models compile on this box without trouble.
 
-    This is not a theoretical guard. A 43-layer tp=32 run needs ~529 GB of
-    weights, and 529 + 32*41 = 1841 GB exceeded the 1999 GB box. With swap=0
-    the kernel livelocked rather than OOM-killing anything: it became
-    unreachable over SSH and had to be power-cycled, losing 45 minutes of
-    weight loading. The 12-layer run fit at 1465 GB and looked like it had
+    This is not a theoretical guard. A 43-layer tp=32 run with inlining needs
+    ~529 GB of weights, and 529 + 32*41 = 1841 GB exceeded the 1999 GB box.
+    With swap=0 the kernel livelocked rather than OOM-killing anything: it
+    became unreachable over SSH and had to be power-cycled, losing 45 minutes
+    of weight loading. The 12-layer run fit at 1465 GB and looked like it had
     headroom, which is exactly why this check has to be arithmetic rather than
     "the last one fit".
     """
     total_layers = int(cfg.get("n_layers", n_layers)) or n_layers
     weights_gb = (n_layers / total_layers) * _TOTAL_PARAMS * 2 / (1024 ** 3)
     compilers = min(max_parallel_compilations or tp, tp)
-    compiler_gb = _COMPILE_GB_PER_RANK * compilers
+    per_rank = (_COMPILE_GB_PER_RANK_INLINED if inline_weights
+                else _COMPILE_GB_PER_RANK_SEPARATE)
+    compiler_gb = per_rank * compilers
     need = weights_gb + compiler_gb
 
     total, avail = _host_ram_gb()
     swap = _swap_gb()
     print(f"[preflight] host RAM: total={total:.0f} GB available={avail:.0f} GB "
           f"swap={swap:.0f} GB")
+    print(f"[preflight] inline_weights_to_neff={inline_weights} "
+          f"=> {per_rank:.0f} GB per concurrent rank")
     print(f"[preflight] estimated peak: weights={weights_gb:.0f} GB "
-          f"+ {compilers} concurrent ranks x {_COMPILE_GB_PER_RANK:.0f} GB "
+          f"+ {compilers} concurrent ranks x {per_rank:.0f} GB "
           f"= {compiler_gb:.0f} GB  =>  {need:.0f} GB")
 
     if need > avail * 0.9:
+        fits = max(0, int((avail * 0.9 - weights_gb) // per_rank))
         msg = (
             f"estimated peak host RAM {need:.0f} GB exceeds 90% of available "
             f"{avail:.0f} GB. With swap={swap:.0f} GB the kernel cannot reclaim, "
             f"so overcommitting hangs the machine instead of failing the run.\n"
             f"Options:\n"
-            f"  --max-parallel-compilations N   (N x {_COMPILE_GB_PER_RANK:.0f} GB; "
-            f"N <= {max(0, int((avail * 0.9 - weights_gb) // _COMPILE_GB_PER_RANK))} "
-            f"fits alongside the weights)\n"
+            + (f"  drop --inline-weights-to-neff   (biggest win: "
+               f"{_COMPILE_GB_PER_RANK_INLINED:.0f} -> "
+               f"{_COMPILE_GB_PER_RANK_SEPARATE:.0f} GB per rank)\n"
+               if inline_weights else "")
+            + f"  --max-parallel-compilations N   (N x {per_rank:.0f} GB; "
+            f"N <= {fits} fits alongside the weights)\n"
             f"  --n-layers <fewer>              (weights scale linearly)\n"
             f"  --force                         (proceed anyway; may hang the host)"
         )
@@ -873,6 +900,13 @@ def main():
                          "when chasing runtime faults.")
     ap.add_argument("--extra-compiler-args", default="",
                     help="Space-separated extra neuronx-cc flags.")
+    ap.add_argument("--inline-weights-to-neff", action="store_true",
+                    help="Bake weights into the NEFF as HLO constants. This is "
+                         "NxD's default but NOT what NxDI's own production path "
+                         "does (model_wrapper.py passes False), and it is far "
+                         "more expensive to compile: every weight becomes an HLO "
+                         "constant that neuronx-cc materializes and copies, in "
+                         "all tp ranks at once. Leave it off for large models.")
     ap.add_argument("--max-parallel-compilations", type=int, default=None,
                     help="Cap concurrent neuronx-cc processes. Default (None) "
                          "lets NxD run one per rank, which at tp=32 measured "
@@ -925,7 +959,9 @@ def main():
 
     with open(args.config) as f:
         preflight_host_ram(json.load(f), args.n_layers, args.tp,
-                           args.max_parallel_compilations, force=args.force)
+                           args.max_parallel_compilations,
+                           inline_weights=args.inline_weights_to_neff,
+                           force=args.force)
 
     workdir = args.compiler_workdir or (
         f"/tmp/dsv4_ws_tp{args.tp}_L{args.n_layers}_S{args.seq_len}"
@@ -938,6 +974,7 @@ def main():
         tp_degree=args.tp,
         compiler_workdir=workdir,
         compiler_args=compiler_args,
+        inline_weights_to_neff=args.inline_weights_to_neff,
     )
     if args.max_parallel_compilations is not None:
         kwargs["max_parallel_compilations"] = args.max_parallel_compilations
