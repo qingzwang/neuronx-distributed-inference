@@ -144,3 +144,6 @@ global_metric_store.json
 
 # Compiler artifacts
 neuronxcc*
+
+# neuronx-cc drops this in the cwd on every trace
+PostSPMDPassesExecutionDuration.txt
