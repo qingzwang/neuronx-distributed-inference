@@ -14,6 +14,7 @@ output on device. Decode works with a device-resident KV cache — validated at
 | Numerics vs CPU reference | cosine 0.99996+ at 1/4/12 layers, TP=8 and TP=32 |
 | Decode (`start_pos > 0`) | works at 5 layers, TP=32: 20 ms/token, cache on device |
 | Decode at 43 layers | works — **94 ms/token** steady state, correct output |
+| GSM8K, 150 problems | **97.3%** EM, TTFT median 7.4 s, TPOT 93.4 ms (see below) |
 | Performance | decode usable; prefill **unusable** — 492 s for one 128-token prefill |
 | `seq_len > 2048` | unsupported, raises (needs an NKI top-k kernel) |
 
@@ -124,6 +125,70 @@ numbers are the same either way (`test_decode_vs_reference.py --no-prefill`
 checks exactly this), it just costs `prompt_len` cheap calls instead of one big
 one.
 
+## GSM8K
+
+```bash
+python src/run_gsm8k.py --artifact /mnt/data/artifacts/dsv4_decode_tp32_L43 \
+    --seq-len 512 --n 150 --max-new 400 --warmup --out /tmp/gsm8k.jsonl
+```
+
+150 problems from `main/test`, 0-shot, greedy, chat-mode encoding:
+
+| | |
+|---|---|
+| accuracy (EM) | **97.3%** (146/150) — 98.6% over the 148 that finished |
+| TTFT | median **7.4 s**, mean 7.9, p95 11.9 (excludes problem 1) |
+| TPOT | mean **93.4 ms**, median 93.4, range 92.9-94.5 |
+| stopped on EOS | 148/150 |
+| hit the 400-token budget | 2/150 — unscoreable, not wrong |
+| mean prompt / generation | 84 / 127 tokens |
+
+**TTFT is exactly `prompt_len x 94 ms`.** Measured per problem it tracks prompt
+length to within a millisecond per token, which is the missing chunked prefill
+stated as a number: ingest is `prompt_len` sequential single-token calls, each
+paying a full forward, so there is no batching win over generation. A real
+prefill path would collapse this to roughly one forward.
+
+Reported TTFT excludes problem 1. In a fresh process the first call carries the
+warmup (`--warmup` moves most of it, and what leaks past still made problem 1
+cost 613 s against a 7.4 s median). Mixing that into the mean inflates it to
+11.9 s and describes nothing real.
+
+The four misses are worth naming, because none is a port bug:
+
+* two hit the 400-token budget mid-derivation (`--max-new` is the limit, not the
+  model)
+* one answered `400/11` where gold is `36` — correct to 36.36, and the
+  last-number rule then scored the `11` of the fraction
+* one is the standard "10 times more than 60" ambiguity (600 vs 660)
+
+Against the model card's 90.8 (8-shot, Base), 97.3 here is not the same
+measurement: this is the *instruct* checkpoint, 0-shot, through its own chat
+encoding, on 150 of 1319 problems. Treat it as "the port reasons correctly at
+full depth", not as a reproduction of the published number.
+
+### The caveat that matters
+
+Problems are **not** independent. The KV cache lives on the device and cannot be
+reset from the host, so problem N+1 begins with problem N's compressed KV still
+resident. `test_cache_reset.py` measures the effect directly: prompt B after
+prompt A diverges from B on a fresh cache, max|dlogit| = 2.36, with different
+tokens.
+
+Three host-side write paths were tried — `fill_`, `data.copy_`, and replacing the
+`nn.Parameter` outright — and all three leave the graph's behaviour unchanged.
+The third is the diagnostic one: the new value reads back correctly from
+`named_parameters()` and the model still emits the pre-reset continuation, so
+`forward_v2` binds its device buffers once and the Python parameters are only the
+seed for that binding. The fix is a `reset` input threaded into the traced graph,
+i.e. a recompile; `cache_reset.py` documents this rather than pretending to solve
+it.
+
+So 97.3% is measured under carry-over. Since window slots above the current
+position are masked out and each problem restarts at position 0, most of the
+stale state is unreachable — but "most" is not "all", and the honest statement is
+that the number is contaminated by an amount bounded by that 2.36 logit delta.
+
 ## Layout
 
 ```
@@ -132,6 +197,8 @@ src/
   compile_neuron.py    the port: XLA patches + parallel_model_trace driver
   decode_patches.py    the decode path: tensor start_pos + aliased KV state
   run_neuron.py        device inference, --mode prefill | decode
+  run_gsm8k.py         GSM8K accuracy + TTFT/TPOT
+  cache_reset.py       KV-cache reset attempt (does not work; see its header)
   shard_loader.py      rank-aware weight loading and sharding
   xla_ops.py           trn2-safe replacements for unsupported ops
   dequant_checkpoint.py  FP4/FP8 -> bf16
@@ -143,6 +210,7 @@ test/
   test_neuron_vs_cpu.py  device logits vs CPU, same weights
   test_decode_vs_reference.py   decode rewrite vs HF's decode, on CPU
   test_decode_neuron_vs_cpu.py  device decode vs CPU, incl. the aliased caches
+  test_cache_reset.py    measures the cross-prompt cache carry-over
   test/spike/            exploratory scripts kept for reference
 ```
 
@@ -298,15 +366,21 @@ every combination of them with the two gate types appears within the first 5.
    token. Batch > 1 is untraced. There is also no stopping criterion, sampling,
    or MTP head — `run_neuron.py --mode decode` is greedy only, and it does not
    stop on the EOS it correctly emits.
-2. **Prefill performance.** One 128-token prefill takes 492 s. The static-shape
+2. **The KV cache cannot be reset without recompiling.** Serving independent
+   requests from one loaded artifact is therefore not correct today: every
+   request inherits the last one's compressed KV (max|dlogit| = 2.36, measured).
+   No host-side write path reaches the runtime's buffers — see `cache_reset.py`
+   for the three that were tried and why the third one's readback passing is the
+   informative part. Needs a `reset` input in the traced graph.
+3. **Prefill performance.** One 128-token prefill takes 492 s. The static-shape
    MoE patch computes all experts and masks, doing ~42.7x the ideal FLOPs
    (2.22 TFLOP/rank/token-batch at 43 layers, TP=32). Fixing this means NxDI's
    blockwise MoE or an NKI kernel. Decode is far less exposed to this — it runs
    one token through the same masked-MoE at 94 ms — so this is a prefill
    problem first.
-3. **`seq_len > 2048`** hits the `k > 32` guard in
+4. **`seq_len > 2048`** hits the `k > 32` guard in
    `xla_ops.topk_indices_unordered`; needs an NKI top-k kernel.
-4. **Artifact size and startup.** 663 GB at full depth, ~400 s to load onto
+5. **Artifact size and startup.** 663 GB at full depth, ~400 s to load onto
    device, plus a ~1920 s first-call warmup before the first token comes back.
    That is ~39 min from process start to first token, against 94 ms for every
    token after it. Unblocking this is what stands between the current state and
