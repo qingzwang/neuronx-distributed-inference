@@ -13,8 +13,8 @@ output on device. Decode works with a device-resident KV cache — validated at
 | Correct output on device | yes, see below |
 | Numerics vs CPU reference | cosine 0.99996+ at 1/4/12 layers, TP=8 and TP=32 |
 | Decode (`start_pos > 0`) | works at 5 layers, TP=32: 20 ms/token, cache on device |
-| Decode at 43 layers | not compiled yet |
-| Performance | prefill **unusable** — 492 s for one 128-token prefill |
+| Decode at 43 layers | works — **94 ms/token** steady state, correct output |
+| Performance | decode usable; prefill **unusable** — 492 s for one 128-token prefill |
 | `seq_len > 2048` | unsupported, raises (needs an NKI top-k kernel) |
 
 Device output for `"It is well known that the capital city of France is"`
@@ -83,6 +83,39 @@ python src/run_neuron.py --mode decode \
 
 Measured at 5 layers, TP=32: 516 s to compile, 79 GB artifact, **20 ms/token**
 against 7.4 s/token for the same work through the prefill graph.
+
+#### At full depth
+
+43 layers, TP=32, `--seq-len 512`, real weights. Compile: 5932 s, 663 GB
+artifact, 32/32 ranks PASS. Load onto device: 404 s. Device memory sits at
+22.15 GB of tensors per core (32 cores, 720 GB total), which is the whole reason
+TP >= 32 — the per-core budget is 24 GB.
+
+```
+[input] 'It is well known that the capital city of France is' -> 11 tokens
+  11111   25.829   ' Paris'     <- top-1, p=0.785
+   2619   22.343   ' **'
+    295   21.679   ' in'
+   7840   21.667   ' located'
+    680   21.403   ' {'
+[full]  'It is well known that the capital city of France is Paris.",\n
+         "label": 0\n}<｜end▁of▁file｜>\n'
+```
+
+Two things worth reading off that. The prefill graph scores `' Paris'` at
+25.562 and this one at 25.829 — two separate graphs, separate device buffers,
+independently sharded weights, same answer, so the decode rewrite's closed-form
+index math agrees with the validated prefill path at full depth. And the
+continuation stays structurally coherent for all 12 steps, closing its JSON and
+emitting a real EOS rather than degenerating, which is the failure mode a subtly
+wrong cache write produces.
+
+**The first call costs ~1920 s; every later call costs 94 ms.** That is a
+one-time warmup, not per-token cost, and it dominates any average taken over a
+short run: this 11-token ingest reported 175 s/token, which is the warmup
+divided by 11 rather than a real rate. Steady-state decode is 94 ms/token,
+measured over 11 consecutive generation steps (92-95 ms, no drift). Budget the
+warmup once per process and ignore it in throughput numbers.
 
 Decode ingests the prompt one token at a time rather than inheriting prefill's
 cache. Prefill and decode are separate traced artifacts with separate device
@@ -259,15 +292,22 @@ every combination of them with the two gate types appears within the first 5.
 
 ## Known gaps
 
-1. **Decode is only validated at 5 layers.** The graph and its numerics are
-   settled (see above), but it has not been compiled at 43 layers, and the
-   prompt-ingest path is `prompt_len` separate calls rather than a chunked
-   prefill. Batch > 1 is untraced. There is also no stopping criterion,
-   sampling, or MTP head — `run_neuron.py --mode decode` is greedy only.
-2. **Performance.** One 128-token prefill takes 492 s. The static-shape MoE
-   patch computes all experts and masks, doing ~42.7x the ideal FLOPs
+1. **Decode's serving path is still minimal.** The graph now runs at full depth
+   (94 ms/token, above), but the prompt-ingest path is `prompt_len` separate
+   calls rather than a chunked prefill, so a long prompt pays one call per
+   token. Batch > 1 is untraced. There is also no stopping criterion, sampling,
+   or MTP head — `run_neuron.py --mode decode` is greedy only, and it does not
+   stop on the EOS it correctly emits.
+2. **Prefill performance.** One 128-token prefill takes 492 s. The static-shape
+   MoE patch computes all experts and masks, doing ~42.7x the ideal FLOPs
    (2.22 TFLOP/rank/token-batch at 43 layers, TP=32). Fixing this means NxDI's
-   blockwise MoE or an NKI kernel.
+   blockwise MoE or an NKI kernel. Decode is far less exposed to this — it runs
+   one token through the same masked-MoE at 94 ms — so this is a prefill
+   problem first.
 3. **`seq_len > 2048`** hits the `k > 32` guard in
    `xla_ops.topk_indices_unordered`; needs an NKI top-k kernel.
-4. **Artifact size.** 661 GB at full depth, and ~390 s to load onto device.
+4. **Artifact size and startup.** 663 GB at full depth, ~400 s to load onto
+   device, plus a ~1920 s first-call warmup before the first token comes back.
+   That is ~39 min from process start to first token, against 94 ms for every
+   token after it. Unblocking this is what stands between the current state and
+   anything servable; it was not investigated here beyond measuring it.
