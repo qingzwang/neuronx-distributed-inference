@@ -82,11 +82,18 @@ def window_topk_idxs(pos, window_size, bsz):
     # Arithmetic select instead of torch.where.
     #
     # `torch.where(j <= pos, j, full_like(j, -1))` is correct and works under
-    # parallel_model_trace, but it fails to lower inside ModelBuilder's
-    # generate_hlo: with all three operands verified (128,)/numel 128/int64/xla:0
-    # it still raises "size of tensor a (128) must match tensor b (0)". The
-    # size-0 operand is internal to the lowering, not anything passed in — dumping
-    # where()'s arguments at the raise shows nothing wrong with them.
+    # parallel_model_trace, but in the joint ModelBuilder graph it raises
+    # "size of tensor a (128) must match tensor b (0)" — with all three operands
+    # verified (128,)/numel 128/int64/xla:0, so the size-0 operand is internal to
+    # the lowering rather than anything passed in.
+    #
+    # Scope, corrected: `where` is NOT broken in general. A standalone
+    # generate_hlo of exactly this expression compiles fine, as does the version
+    # with _batch's broadcast-add and the version with an aliased state output.
+    # Something about the full graph triggers it and the minimal reproducers do
+    # not, so the real trigger is still unidentified. Reverting this to `where`
+    # reproduces the failure in the joint graph, which is why the workaround
+    # stays.
     #
     # mask * j + (1 - mask) * (-1) computes the identical result with mul/add,
     # which lower cleanly. Slightly more arithmetic, no select.
