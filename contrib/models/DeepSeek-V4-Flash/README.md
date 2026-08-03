@@ -15,7 +15,8 @@ output on device. Decode works with a device-resident KV cache — validated at
 | Decode (`start_pos > 0`) | works at 5 layers, TP=32: 20 ms/token, cache on device |
 | Decode at 43 layers | works — **94 ms/token** steady state, correct output |
 | GSM8K, 150 problems | **97.3%** EM, TTFT median 7.4 s, TPOT 93.4 ms (see below) |
-| Performance | decode usable; prefill **unusable** — 492 s for one 128-token prefill |
+| Prefill, 128 tokens | **0.85 s** steady state (43 layers, TP=32) — 6.6 ms/position |
+| Performance | both paths usable; see the prefill/decode comparison below |
 | `seq_len > 2048` | unsupported, raises (needs an NKI top-k kernel) |
 
 Device output for `"It is well known that the capital city of France is"`
@@ -125,6 +126,53 @@ numbers are the same either way (`test_decode_vs_reference.py --no-prefill`
 checks exactly this), it just costs `prompt_len` cheap calls instead of one big
 one.
 
+## Prefill vs decode, same 128-token prompt
+
+An earlier version of this README reported "prefill **unusable** — 492 s for one
+128-token prefill". That number was a **first call**, and this port has a large
+one-time warmup on any graph. Measured properly, with warmup excluded:
+
+```bash
+python src/bench_prefill_ttft.py \
+    --artifact /mnt/data/artifacts/dsv4_prefill_tp32_L43_S128 \
+    --seq-len 128 --repeats 6
+```
+
+```
+warmup call:  464 s
+call 1:       569 s      <- warmup takes TWO calls, not one
+call 2:      0.85 s
+call 3:      0.85 s
+call 4:      0.85 s
+call 5:      0.85 s      all five return ' Paris'
+```
+
+| time to first token, 128-token prompt | | per position |
+|---|---|---|
+| prefill graph, one call | **0.85 s** | 6.6 ms |
+| decode graph, 128 sequential calls | 12.0 s | 93.7 ms |
+
+**Prefill is 14x faster to first token, and 14x cheaper per position.** The
+batched forward amortizes the masked MoE: every position in the call reuses one
+pass over the expert weights, so the 21.8x of redundant weight traffic that
+dominates a single-token decode step is paid once for 128 positions instead of
+128 times. That is why the per-position cost falls by roughly the same factor as
+the batch width.
+
+Two consequences worth stating plainly:
+
+* **The 492 s figure was warmup, not per-prefill cost.** Anything built on it —
+  including "batching wins nothing because the MoE FLOPs add up linearly" — was
+  wrong. The FLOPs do add up; the *weight traffic*, which is what this graph is
+  bound on at 190 GB/s/rank, does not.
+* **A served TTFT should use the prefill graph.** The GSM8K numbers below use
+  decode for prompt ingest, because decode cannot inherit prefill's cache (NxD
+  exposes no way to hand one graph's aliased state to another). Fixing that hand-off
+  is worth ~14x on TTFT and is a bigger, better-defined win than the MoE rewrite.
+
+Warmup is per graph and per process: budget ~450 s twice on prefill, plus 443 s
+to load the artifact. Read the *median* of repeated calls, never the mean.
+
 ## GSM8K
 
 ```bash
@@ -143,11 +191,17 @@ python src/run_gsm8k.py --artifact /mnt/data/artifacts/dsv4_decode_tp32_L43 \
 | hit the 400-token budget | 2/150 — unscoreable, not wrong |
 | mean prompt / generation | 84 / 127 tokens |
 
-**TTFT is exactly `prompt_len x 94 ms`.** Measured per problem it tracks prompt
-length to within a millisecond per token, which is the missing chunked prefill
-stated as a number: ingest is `prompt_len` sequential single-token calls, each
-paying a full forward, so there is no batching win over generation. A real
-prefill path would collapse this to roughly one forward.
+**TTFT is exactly `prompt_len x 93.7 ms`.** Measured per problem it tracks prompt
+length to within a millisecond per token (fit over 149 problems: 93.7 ms/token,
+intercept -0.01 s, max residual 0.18 s). That is the cost of ingesting through
+the *decode* graph: `prompt_len` sequential single-token calls, each paying a
+full forward, so there is no batching win over generation.
+
+This is a harness choice, not a limit of the port — the prefill graph does the
+same 128-token prompt in **0.85 s**, 14x faster (see above). Decode is used here
+only because it cannot inherit prefill's cache, so a decode run has to rebuild
+that cache itself. Routing ingest through prefill and handing the cache over
+would cut TTFT by ~14x; that hand-off is gap #1.
 
 Reported TTFT excludes problem 1. In a fresh process the first call carries the
 warmup (`--warmup` moves most of it, and what leaks past still made problem 1
@@ -361,27 +415,36 @@ every combination of them with the two gate types appears within the first 5.
 ## Known gaps
 
 1. **Decode's serving path is still minimal.** The graph now runs at full depth
-   (94 ms/token, above), but the prompt-ingest path is `prompt_len` separate
-   calls rather than a chunked prefill, so a long prompt pays one call per
-   token. Batch > 1 is untraced. There is also no stopping criterion, sampling,
-   or MTP head — `run_neuron.py --mode decode` is greedy only, and it does not
-   stop on the EOS it correctly emits.
+   (94 ms/token, above), but **decode cannot inherit prefill's cache**, so a
+   decode run ingests the prompt itself, one call per token. That costs ~14x on
+   TTFT against just using the prefill graph (12.0 s vs 0.85 s at 128 tokens),
+   which makes the cache hand-off the single highest-value fix in this list. NxD
+   exposes no way to pass one traced graph's aliased state to another, so it
+   needs either a combined graph or a way to seed decode's state from a prefill
+   run. Batch > 1 is untraced. There is also no stopping criterion, sampling, or
+   MTP head — `run_neuron.py --mode decode` is greedy only, and it does not stop
+   on the EOS it correctly emits.
 2. **The KV cache cannot be reset without recompiling.** Serving independent
    requests from one loaded artifact is therefore not correct today: every
    request inherits the last one's compressed KV (max|dlogit| = 2.36, measured).
    No host-side write path reaches the runtime's buffers — see `cache_reset.py`
    for the three that were tried and why the third one's readback passing is the
    informative part. Needs a `reset` input in the traced graph.
-3. **Prefill performance.** One 128-token prefill takes 492 s. The static-shape
-   MoE patch computes all experts and masks, doing ~42.7x the ideal FLOPs
-   (2.22 TFLOP/rank/token-batch at 43 layers, TP=32). Fixing this means NxDI's
-   blockwise MoE or an NKI kernel. Decode is far less exposed to this — it runs
-   one token through the same masked-MoE at 94 ms — so this is a prefill
-   problem first.
+3. **The static-shape MoE does ~21.8x the necessary weight traffic.** It computes
+   all 256 experts per position and masks, instead of dispatching the 6 the gate
+   selects: 17.7 GB of weights read per token per rank against 0.81 GB ideal. At
+   the measured 190 GB/s/rank that is what sets decode's 94 ms/token — a
+   dispatched MoE at the same bandwidth would be ~4.3 ms. Fixing it means NxDI's
+   blockwise MoE or an NKI kernel. Note this hits *decode* hardest, not prefill:
+   a batched prefill call amortizes one pass over the expert weights across all
+   its positions, which is exactly why prefill costs 6.6 ms/position while decode
+   costs 93.7 ms.
 4. **`seq_len > 2048`** hits the `k > 32` guard in
    `xla_ops.topk_indices_unordered`; needs an NKI top-k kernel.
-5. **Artifact size and startup.** 663 GB at full depth, ~400 s to load onto
-   device, plus a ~1920 s first-call warmup before the first token comes back.
-   That is ~39 min from process start to first token, against 94 ms for every
-   token after it. Unblocking this is what stands between the current state and
-   anything servable; it was not investigated here beyond measuring it.
+5. **Artifact size and startup.** 663 GB at full depth and ~440 s to load, plus a
+   warmup that takes **two** calls, not one: measured 464 s then 569 s on the
+   prefill graph before it settled at 0.85 s. So ~25 min from process start to a
+   representative timing, against 0.85 s for every call after it. Any benchmark
+   here must discard at least two calls and report a median — a mean over a set
+   containing one warmup outlier is meaningless, which is how the old "492 s
+   prefill" figure came about. Not investigated beyond measuring it.
