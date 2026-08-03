@@ -141,8 +141,8 @@ def _patch_parallel_embedding_for_xla(hf_mod):
             )
             y = _F.embedding(local, self.weight)
             y = _torch.where(in_range.unsqueeze(-1), y, _torch.zeros_like(y))
-            import torch.distributed as _dist
-            _dist.all_reduce(y)
+            import collectives
+            collectives.all_reduce(y)
             return y
         return _F.embedding(x, self.weight)
 
@@ -214,8 +214,8 @@ def _patch_moe_forward_for_xla(hf_mod):
         # at call time so this patched forward sees updates that happen after
         # Transformer.__init__ mutates them.
         if hf_mod.world_size > 1:
-            import torch.distributed as _dist
-            _dist.all_reduce(y)
+            import collectives
+            collectives.all_reduce(y)
         y = y + self.shared_experts(x).float()
         return y.type_as(x).view(shape)
 
@@ -457,6 +457,28 @@ def _patch_attention_o_proj_for_high_tp(hf_mod):
     hf_mod.Attention.forward = attention_forward
 
 
+def set_index_helper_device(device):
+    """Tell the index helpers which device to build their constants on.
+
+    `_patch_index_helpers_for_xla` normally records this from `input_ids` inside
+    its own `Transformer.forward` wrapper. A caller that invokes the *unwrapped*
+    forward — as the joint ModelBuilder path does, since it needs the raw function
+    to avoid a wrapper loop — skips that, leaving the device None and the helpers
+    building CPU tensors that later fail to concat with on-device ones:
+
+        RuntimeError: Expected all tensors in the given list to be XLA tensors.
+
+    Set it explicitly in that case. No-op if the patch has not been applied.
+    """
+    if _INDEX_HELPER_STATE is not None:
+        _INDEX_HELPER_STATE["device"] = device
+
+
+# Populated by _patch_index_helpers_for_xla so set_index_helper_device can reach
+# the same dict the patched helpers close over.
+_INDEX_HELPER_STATE = None
+
+
 def _patch_index_helpers_for_xla(hf_mod):
     """Make get_window/compress_topk_idxs build their index tensors on-device.
 
@@ -483,6 +505,8 @@ def _patch_index_helpers_for_xla(hf_mod):
     import torch.nn.functional as _F
 
     state = {"device": None}
+    global _INDEX_HELPER_STATE
+    _INDEX_HELPER_STATE = state
 
     def _dev():
         return state["device"]
@@ -545,9 +569,14 @@ def _patch_index_helpers_for_xla(hf_mod):
     hf_mod.get_window_topk_idxs = get_window_topk_idxs
     hf_mod.get_compress_topk_idxs = get_compress_topk_idxs
     hf_mod.Transformer.forward = transformer_forward
-    # _TraceWrapper looks for __wrapped__ to bypass @torch.inference_mode();
-    # our replacement is already unwrapped, so point it at itself.
-    transformer_forward.__wrapped__ = transformer_forward
+    # The trace wrappers look for __wrapped__ to bypass @torch.inference_mode().
+    # This replacement is already unwrapped, so it has to resolve to something
+    # callable with the same signature — but NOT to itself: a self-referential
+    # __wrapped__ is a cycle, and `inspect.unwrap` (which ModelBuilder calls,
+    # unlike parallel_model_trace's hand-rolled getattr) raises
+    # "ValueError: wrapper loop when unwrapping". Point it at the undecorated
+    # function this wraps instead, which is what an unwrap is looking for anyway.
+    transformer_forward.__wrapped__ = original_forward
     return state
 
 
@@ -609,8 +638,8 @@ def _patch_topk_for_xla(hf_mod):
         )
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
         if hf_mod.world_size > 1:
-            import torch.distributed as _dist
-            _dist.all_reduce(index_score)
+            import collectives
+            collectives.all_reduce(index_score)
         # HF builds these arange masks with the global default device set to
         # cuda; under XLA tracing the default device is CPU, so they must be
         # pinned to the activation's device explicitly or the trace aborts with
