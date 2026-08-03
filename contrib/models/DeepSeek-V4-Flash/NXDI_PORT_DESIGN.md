@@ -169,6 +169,21 @@ comparison against something already trusted, not on "it compiles".
    the current number is measured under cache carry-over; with a working reset the
    comparison becomes cleaner, so a *change* here needs explaining either way.
 
+## Progress
+
+| step | state | gate |
+|---|---|---|
+| 2. init-independent compression ring | **done** | `test_compress_state_mask.py` — 28 ring states x 4 init values, exact (max\|d\| = 0.00e+00) |
+| 1. config + ragged state layout | **done** | `test_dsv4_config.py` — all shapes match HF for 5 layer types; 17 = 17 states vs the validated port |
+| cache manager | **done** | `test_dsv4_kv_cache.py` — alias ordering is a stable bijection; positional convention matches `DecoderModelInstance.get()` |
+| 3. compressor + indexer forwards | next | layer parity vs patched HF, per layer type |
+| 4. MoE + head + model class | | parity at 5 layers |
+| 5. `NeuronBaseForCausalLM` + compile | | device parity vs the standalone prefill artifact |
+
+Steps 2 and the cache manager landed before step 1's attention work because both
+are prerequisites for it: the attention forwards read state through the manager and
+mask through `compress_state`, so their contracts had to be pinned first.
+
 ## Order of work
 
 1. `modeling_dsv4.py` skeleton: config + attention subclass, one layer type, no
