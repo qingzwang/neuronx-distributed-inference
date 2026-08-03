@@ -412,8 +412,8 @@ def make_decode_forwards(hf_mod):
         index_score = _torch.einsum("bshd,btd->bsht", q, cache[:bsz])
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
         if hf_mod.world_size > 1:
-            import torch.distributed as _dist
-            _dist.all_reduce(index_score)
+            import collectives
+            collectives.all_reduce(index_score)
 
         n_valid = (pos + 1) // ratio
         slots = _torch.arange(cache.size(1), device=index_score.device)

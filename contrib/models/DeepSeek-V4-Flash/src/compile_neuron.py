@@ -457,6 +457,20 @@ def _patch_attention_o_proj_for_high_tp(hf_mod):
     hf_mod.Attention.forward = attention_forward
 
 
+def index_helper_state():
+    """The dict the most recently patched index helpers read their device from.
+
+    Callers that patch several models must capture this right after their own
+    `apply_xla_patches` call and set the device on *that* dict, not via the
+    module-level `set_index_helper_device`. `_INDEX_HELPER_STATE` only ever holds
+    the newest one, so with two graphs registered the first graph's helpers end up
+    reading a dict nobody writes: device stays None, they build CPU tensors, and
+    the trace dies with "Expected all tensors in the given list to be XLA
+    tensors". See compile_joint.
+    """
+    return _INDEX_HELPER_STATE
+
+
 def set_index_helper_device(device):
     """Tell the index helpers which device to build their constants on.
 

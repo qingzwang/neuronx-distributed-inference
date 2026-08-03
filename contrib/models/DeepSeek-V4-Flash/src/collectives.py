@@ -27,7 +27,27 @@ it does not. `parallel_model_trace` initialises the TP group too, so this is the
 correct call on both paths rather than a ModelBuilder special case.
 """
 
-import torch.distributed as dist
+import torch
+
+
+def _dist():
+    """`torch.distributed` resolved NOW, not at import time.
+
+    This indirection is the whole point. `mock_distributed` works by *replacing
+    the `torch.distributed` attribute on the torch module* for the duration of
+    tracing. A module-level `import torch.distributed as dist` captures the real
+    one before that swap and keeps using it, so `get_world_size()` returns 1 even
+    at tp=32 — and HF, which reads it in `Transformer.__init__`, then builds
+    unsharded modules whose shapes disagree with the sharded state around them.
+
+    That mismatch is what produced "size of tensor a (128) must match tensor b
+    (0)": with world_size stuck at 1, `n_local_heads` and the o_proj split were
+    computed for a single rank, and a downstream index tensor came out empty.
+
+    Resolving per call sees whatever `torch.distributed` is bound to at that
+    moment, mocked or not.
+    """
+    return torch.distributed
 
 
 def tp_group():
@@ -56,18 +76,18 @@ def all_reduce(tensor):
     """
     group = tp_group()
     if group is None:
-        dist.all_reduce(tensor)
+        _dist().all_reduce(tensor)
     else:
-        dist.all_reduce(tensor, group=group)
+        _dist().all_reduce(tensor, group=group)
 
 
 def all_gather(tensor_list, tensor):
     """`dist.all_gather` over the TP group."""
     group = tp_group()
     if group is None:
-        dist.all_gather(tensor_list, tensor)
+        _dist().all_gather(tensor_list, tensor)
     else:
-        dist.all_gather(tensor_list, tensor, group=group)
+        _dist().all_gather(tensor_list, tensor, group=group)
 
 
 class _GroupAwareDist:
@@ -88,7 +108,10 @@ class _GroupAwareDist:
     all_gather = staticmethod(all_gather)
 
     def __getattr__(self, name):
-        return getattr(dist, name)
+        # Resolve against the *current* torch.distributed so get_world_size(),
+        # get_rank() and is_initialized() see mock_distributed's stubs while
+        # tracing. Binding these at import time is what left world_size at 1.
+        return getattr(_dist(), name)
 
 
 def patch_hf_dist(hf_mod):

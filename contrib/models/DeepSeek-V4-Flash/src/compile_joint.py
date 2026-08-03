@@ -39,40 +39,68 @@ empty dict and rank-local weights go in through
 **Weights are loaded per rank on the host, not by NxD.** Same reason. This is the
 existing `shard_loader.load_rank_weights` path, unchanged.
 
-STATUS: prefill traces, decode does not. Work in progress.
----------------------------------------------------------
-Confirmed working:
-  * both graphs register in one builder and are recognised as separate keys
-  * prefill generates HLO cleanly at TP=2 and TP=32 (1.5 s)
-  * the toy-model spike proves the shared-cache mechanism itself
-    (test/spike/test_modelbuilder_shared_state.py)
+STATUS: prefill traces; decode blocked on one unexplained shape error.
+----------------------------------------------------------------------
+Working and verified:
+  * both graphs register as separate keys in one builder
+  * prefill generates HLO cleanly at TP=2 and TP=32 (~5 s)
+  * the shared-cache mechanism itself, on a toy model
+    (test/spike/test_modelbuilder_shared_state.py: decode sees prefill's writes,
+    9.0 vs 5.0 for an isolated cache; re-calling initialize() clears it)
+  * **prefill and decode BOTH generate HLO when driven directly** — calling this
+    module's own `_make_instance()` / `_example_inputs()` under
+    `mock_distributed`, in ModelBuilder's own load-all-then-trace order, with its
+    exact `generate_hlo` flags and `set_aot_mode(True)`. Both come back [ok].
 
-Blocked: the decode graph fails during HLO generation with
+Blocked: the same two instances fail inside `builder.trace()` with
 
     RuntimeError: The size of tensor a (128) must match the size of
                   tensor b (0) at non-singleton dimension 0
 
-attributed to `decode_patches.window_topk_idxs`'s `j <= pos`. What is known:
+pointing at `decode_patches.window_topk_idxs`. Narrowed as far as printing
+inside the driver at the point of failure:
 
-  * every operand there is provably correct at that point. An unconditional
-    probe prints `win=128 j=(128,)/128 pos=()/1 dev=xla:0`, and the comparison
-    itself returns `(128,)` when evaluated separately.
-  * `window_topk_idxs` compiles and runs correctly on XLA in isolation with the
-    same inputs (verified standalone: returns (1, 1, 128), materialises to -125).
-  * decode fails the same way when registered ALONE, so this is not
-    cross-key interference from prefill's trace.
-  * it is not the 0-d `start_pos` (passing shape (1,) changes nothing), not
-    device mixing (both xla:0), and not meta-device init (that raises a
-    different error).
+    [WTK] win=128 j=(128,)/128 pos=()/1 bsz=1 cmp=(128,)
+    [WTK] full_like=(128,) mask=(128,)
+    <raise>
 
-So the failing op is almost certainly NOT the one in the traceback: XLA is lazy,
-and the error surfaces at the first sync point rather than where the bad shape
-was created. `XLA_USE_EAGER_DEBUG_MODE=1` would localise it but segfaults on this
-model. The next step is to bisect decode_patches by materialising intermediates
-(`.cpu()`) one at a time under ModelBuilder until the real origin appears.
+So `j <= pos` evaluates to (128,) and `full_like(j, -1)` to (128,) — every
+operand valid — and then `torch.where(mask, j, fl)` raises about a 0-size
+tensor. Probes placed after that line (`_batch`, and the ops following
+`window_topk_idxs`) never print, so nothing downstream is reached.
 
-Everything else in this file is validated and reusable; the four ModelBuilder
-integration fixes below were each needed to get this far.
+Ruled out by experiment, not by reasoning:
+  * the op in the traceback (it succeeds when forced separately)
+  * `window_topk_idxs` itself (compiles and runs standalone on XLA: (1,1,128),
+    materialises to -125)
+  * 0-d vs (1,)-shaped `start_pos` — both fail here, and 0-d is required anyway
+  * explicit broadcasting of `pos` to j's shape before the compare
+  * device mixing (all xla:0), meta-device init (different error)
+  * cross-key interference (decode fails alone too)
+  * MoE / ParallelHead all_gather (traced clean at TP=2)
+
+Three REAL bugs were found and fixed along the way, each of which produced this
+same symptom and each of which is independently verified:
+  1. `collectives.py` bound `torch.distributed` at import time, before
+     `mock_distributed` swaps the module object, so `get_world_size()` returned 1
+     at any TP. HF then built unsharded modules. Fixed by late binding; confirmed
+     by `world_size` going 1 -> 2 and all five layer types then tracing.
+  2. `start_pos` was dropped from prefill's graph as an unused input
+     ("...will be ignored (index=1, shape=[1], dtype=int32)"), and since both
+     graphs share one input signature, decode lost it too. Fixed by keeping it
+     alive with `+ 0 * start_pos`; the warning is gone.
+  3. `compile_neuron._INDEX_HELPER_STATE` is a module global holding only the
+     newest patch, so with two graphs registered the first one's index helpers
+     read a dict nobody writes (device None -> CPU tensors). Fixed with
+     `index_helper_state()` captured per graph; confirmed by prefill going
+     [FAIL] -> [ok] in load-all-then-trace order.
+
+That the direct-drive harness now passes while `builder.trace()` does not means
+the remaining cause is in what trace() does *around* HLO generation — the most
+likely candidate is that it runs inside a `torch.multiprocessing` worker with
+`file_system` sharing, where the private per-key `model` modules and their
+closures are re-created in a context these fixes have not been checked in.
+Next step: make the failing path print from inside that worker.
 
 Usage:
     python src/compile_joint.py --tp 32 --n-layers 5 --seq-len 256 \\
@@ -153,7 +181,24 @@ def _build_hf_model():
     sys.modules[spec.name] = hf
     spec.loader.exec_module(hf)
 
+    # world_size / rank are read at exec_module time from `dist.get_world_size()`
+    # — but model.py's own `import torch.distributed as dist` captures whatever
+    # torch.distributed is at that instant, and under mock_distributed the module
+    # object is swapped, not mutated. The private copy therefore records
+    # world_size = 1 even at tp=32, HF builds unsharded modules, and a downstream
+    # index tensor comes out empty ("size of tensor a (128) must match tensor b
+    # (0)"). Re-read them here, after the module body has run.
+    import torch.distributed as _live
+    if _live.is_initialized():
+        hf.world_size = _live.get_world_size()
+        hf.rank = _live.get_rank()
+
     compile_neuron.apply_xla_patches(hf)
+    # Capture THIS graph's index-helper state dict. compile_neuron keeps only the
+    # newest one in a module global, so with two graphs registered the earlier
+    # one's helpers would read a dict nobody writes (device None -> CPU tensors
+    # -> "Expected all tensors in the given list to be XLA tensors").
+    helper_state = compile_neuron.index_helper_state()
     # ModelBuilder traces rank 0 under mock_distributed, which leaves all_reduce
     # real while never creating a default group. Point HF's `dist` at a shim that
     # pins collectives to the TP group, the way NxD's own layers do.
@@ -171,7 +216,7 @@ def _build_hf_model():
             cfg["compress_ratios"] = cfg["compress_ratios"][:_N_LAYERS]
 
     m = hf.Transformer(hf.ModelArgs(**cfg)).eval()
-    return m, hf
+    return m, hf, helper_state
 
 
 def _install_dual_patches(hf):
@@ -245,7 +290,8 @@ class _JointWrapper(torch.nn.Module):
     the graphs would silently alias each other's caches to the wrong slots.
     """
 
-    def __init__(self, inner, hf_mod, mode, slots, state, raw_forward):
+    def __init__(self, inner, hf_mod, mode, slots, state, raw_forward,
+                 helper_state):
         super().__init__()
         self.inner = inner
         self._hf = hf_mod
@@ -261,6 +307,7 @@ class _JointWrapper(torch.nn.Module):
         # "Default process group has not been initialized".
         self._state = state
         self._raw_forward = raw_forward
+        self._helper_state = helper_state
 
     def forward(self, input_ids, start_pos):
         import decode_patches
@@ -276,11 +323,33 @@ class _JointWrapper(torch.nn.Module):
             # unwrapped forward (a wrapper loop otherwise breaks inspect.unwrap),
             # so that recording never happens — set it directly or the helpers
             # emit CPU tensors that fail to cat with on-device ones.
-            import compile_neuron
-            compile_neuron.set_index_helper_device(input_ids.device)
+            self._helper_state["device"] = input_ids.device
 
             logits = self._raw_forward(self.inner, input_ids,
                                        start_pos.reshape(()))
+
+            if self._mode == "prefill":
+                # Keep start_pos ALIVE in prefill's graph.
+                #
+                # Prefill's forwards hardcode position 0 (that is the whole point
+                # of a prefill graph), so start_pos is a dead input here. NxD then
+                # drops it — hlo_conversion.py warns "Received an input tensor
+                # that was unused ... so the tensor will be ignored
+                # (index=1, shape=[1], dtype=int32)" — and because both graphs
+                # share one input signature, decode loses the input too. Decode's
+                # `pos` then arrives as a zero-element tensor, and `j <= pos`
+                # broadcasts 128 against 0:
+                #
+                #   RuntimeError: The size of tensor a (128) must match the size
+                #                 of tensor b (0) at non-singleton dimension 0
+                #
+                # ...reported inside window_topk_idxs, which is why this looked
+                # like a decode bug for so long. It is a *prefill* bug.
+                #
+                # Adding 0 * start_pos is shape-static, numerically a no-op in
+                # bf16 (start_pos is 0 in prefill anyway), and makes the input a
+                # real data dependency of the output so it survives.
+                logits = logits + (start_pos.reshape(()).to(logits.dtype) * 0)
 
             outs = [logits]
             for mod, name in self._slots:
@@ -299,7 +368,7 @@ def _make_instance(mode):
         import prefill_patches
         import shard_loader
 
-        m, hf = _build_hf_model()
+        m, hf, helper_state = _build_hf_model()
         if _LOAD_WEIGHTS:
             shard_loader.load_rank_weights(
                 m, _MODEL_PATH, rank=hf.rank, world_size=hf.world_size,
@@ -322,7 +391,8 @@ def _make_instance(mode):
 
         slots, aliases = decode_patches.collect_state_aliases(
             m, n_real_outputs=1)
-        inst.module = _JointWrapper(m, hf, mode, slots, state, raw_forward)
+        inst.module = _JointWrapper(m, hf, mode, slots, state, raw_forward,
+                                    helper_state)
         inst.input_output_aliases = [aliases]
 
     inst.load_module = load_module
@@ -332,18 +402,20 @@ def _make_instance(mode):
 def _example_inputs(mode):
     n_active = 1 if mode == "decode" else _PREFILL_LEN
     ids = torch.zeros(_MAX_BATCH_SIZE, n_active, dtype=torch.long)
-    # start_pos is shape (1,), NOT 0-d. ModelBuilder keys its shape router on
-    # `list(tensor.shape)`, which is `[]` for a 0-d tensor, and its flattener
-    # does not round-trip that reliably — the value arrives in the graph as a
-    # 0-*element* tensor, so `j <= pos` broadcasts 128 against 0 and raises
-    # "size of tensor a (128) must match the size of tensor b (0)".
-    # parallel_model_trace tolerated 0-d; this path does not. The wrapper
-    # reshapes to () before use, so nothing downstream changes.
+    # start_pos must be 0-d, not shape (1,).
+    #
+    # A (1,)-shaped int32 input gets mangled somewhere between the flattener and
+    # the HLO: the value reaches the graph as a zero-*element* tensor, so
+    # `j <= pos` broadcasts 128 against 0 and raises "size of tensor a (128) must
+    # match the size of tensor b (0)" inside window_topk_idxs. A 0-d tensor
+    # round-trips correctly. (Both shapes fail while start_pos is also being
+    # dropped as an unused prefill input — fix that first, see _JointWrapper —
+    # which is why this looked shape-independent at first.)
     #
     # Decode traces at position 1, not 0: position 0 would exercise the
     # degenerate case of any pos-derived mask, and decode is only ever entered
     # at pos >= 1.
-    pos = torch.tensor([1 if mode == "decode" else 0], dtype=torch.int32)
+    pos = torch.tensor(1 if mode == "decode" else 0, dtype=torch.int32)
     return [(ids, pos)]
 
 
