@@ -166,9 +166,13 @@ Two consequences worth stating plainly:
   wrong. The FLOPs do add up; the *weight traffic*, which is what this graph is
   bound on at 190 GB/s/rank, does not.
 * **A served TTFT should use the prefill graph.** The GSM8K numbers below use
-  decode for prompt ingest, because decode cannot inherit prefill's cache (NxD
-  exposes no way to hand one graph's aliased state to another). Fixing that hand-off
-  is worth ~14x on TTFT and is a bigger, better-defined win than the MoE rewrite.
+  decode for prompt ingest, because decode cannot inherit prefill's cache. That
+  is a consequence of the tracing API this port uses, not a limit of the
+  hardware: NxDI shares one KV cache across its context-encoding and
+  token-generation graphs by registering both in one `ModelBuilder`, and the same
+  path exposes the host buffer access that would fix the cache reset. See
+  **JOINT_INFERENCE.md** for the mechanism and what porting to it involves.
+  Worth ~14x on TTFT, and a better-defined win than the MoE rewrite.
 
 Warmup is per graph and per process: budget ~450 s twice on prefill, plus 443 s
 to load the artifact. Read the *median* of repeated calls, never the mean.
@@ -418,18 +422,21 @@ every combination of them with the two gate types appears within the first 5.
    (94 ms/token, above), but **decode cannot inherit prefill's cache**, so a
    decode run ingests the prompt itself, one call per token. That costs ~14x on
    TTFT against just using the prefill graph (12.0 s vs 0.85 s at 128 tokens),
-   which makes the cache hand-off the single highest-value fix in this list. NxD
-   exposes no way to pass one traced graph's aliased state to another, so it
-   needs either a combined graph or a way to seed decode's state from a prefill
-   run. Batch > 1 is untraced. There is also no stopping criterion, sampling, or
+   which makes the cache hand-off the single highest-value fix in this list. The
+   fix is known: NxDI registers its CTE and TKG graphs in one `ModelBuilder` and
+   `build_state_initializer` hands them a single shared cache, so the sharing
+   happens at build time rather than by copying between artifacts. Porting
+   `compile_neuron.py` to that API also gets the cache reset (gap #2) and
+   bucketing. See JOINT_INFERENCE.md. Batch > 1 is untraced. There is also no stopping criterion, sampling, or
    MTP head — `run_neuron.py --mode decode` is greedy only, and it does not stop
    on the EOS it correctly emits.
-2. **The KV cache cannot be reset without recompiling.** Serving independent
-   requests from one loaded artifact is therefore not correct today: every
-   request inherits the last one's compressed KV (max|dlogit| = 2.36, measured).
-   No host-side write path reaches the runtime's buffers — see `cache_reset.py`
-   for the three that were tried and why the third one's readback passing is the
-   informative part. Needs a `reset` input in the traced graph.
+2. **The KV cache cannot be reset from the host on this API.** Serving
+   independent requests from one loaded artifact is therefore not correct today:
+   every request inherits the last one's compressed KV (max|dlogit| = 2.36,
+   measured). NxD does support this — `NxDModel.write_to_neuron_buffer` — but only
+   on the `ModelBuilder` path; `parallel_model_trace` returns a
+   `TensorParallelNeuronModel`, which has no such method, and the three
+   unsupported host writes all silently no-op. Same fix as gap #1.
 3. **The static-shape MoE does ~21.8x the necessary weight traffic.** It computes
    all 256 experts per position and masks, instead of dispatching the 6 the gate
    selects: 17.7 GB of weights read per token per rank against 0.81 GB ideal. At

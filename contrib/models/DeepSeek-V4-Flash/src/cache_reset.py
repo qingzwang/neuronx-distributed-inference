@@ -20,11 +20,26 @@ aliased state actually travels on a *loaded* artifact: `forward_v2` binds its
 device buffers once and the NEFF updates them in place thereafter. The Python
 parameters are the seed for that binding, not a live view of it.
 
-Consequence: there is no host-side reset. Resetting the cache means either
-reloading the artifact (~400 s + warmup, i.e. per-problem cost far above the
-94 ms/token the graph is worth) or adding a `reset` input to the graph and
-recompiling so the zeroing happens inside the traced computation. The latter is
-the right fix and is not done here.
+ROOT CAUSE (found later): the port is on the wrong tracing API. NxD *does*
+support host-side state access — `NxDModel.read_from_neuron_buffer` and
+`.write_to_neuron_buffer` (neuronx_distributed/trace/nxd_model/nxd_model.py:355
+and :382) — but those live on `NxDModel`, which is what `ModelBuilder` returns.
+`parallel_model_trace` returns `TensorParallelNeuronModel`, which has no such
+method:
+
+    [m for m in dir(TensorParallelNeuronModel) if 'buffer' in m]
+    -> ['get_buffer', 'named_buffers', 'register_buffer']   # plain nn.Module
+    [m for m in dir(NxDModel) if 'buffer' in m]
+    -> [..., 'read_from_neuron_buffer', 'write_to_neuron_buffer']
+
+So this is not a missing capability in the runtime, it is a capability the port
+cannot reach from the API it was built on. Fixing it properly means moving
+`compile_neuron.py` to `ModelBuilder`, which also unblocks joint prefill+decode
+for the same reason — see JOINT_INFERENCE.md.
+
+Until then: reloading the artifact (~440 s + warmup) is the only way to get a
+clean cache, which is far above the 94 ms/token the graph is worth, so
+multi-prompt runs carry the contamination measured below.
 
 `test_cache_reset.py` measures the contamination this leaves: running prompt B
 after prompt A changes B's tokens, max|dlogit| = 2.36. Any multi-prompt
