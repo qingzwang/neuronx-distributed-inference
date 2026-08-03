@@ -79,7 +79,19 @@ def window_topk_idxs(pos, window_size, bsz):
     against both HF branches for p = 1..19 in test_decode_primitives.py.
     """
     j = torch.arange(window_size, device=pos.device)
-    return _batch(torch.where(j <= pos, j, torch.full_like(j, -1)), bsz)
+    # Arithmetic select instead of torch.where.
+    #
+    # `torch.where(j <= pos, j, full_like(j, -1))` is correct and works under
+    # parallel_model_trace, but it fails to lower inside ModelBuilder's
+    # generate_hlo: with all three operands verified (128,)/numel 128/int64/xla:0
+    # it still raises "size of tensor a (128) must match tensor b (0)". The
+    # size-0 operand is internal to the lowering, not anything passed in — dumping
+    # where()'s arguments at the raise shows nothing wrong with them.
+    #
+    # mask * j + (1 - mask) * (-1) computes the identical result with mul/add,
+    # which lower cleanly. Slightly more arithmetic, no select.
+    keep = (j <= pos).to(j.dtype)
+    return _batch(keep * j - (1 - keep), bsz)
 
 
 def compress_topk_idxs(pos, ratio, max_comp, offset, bsz):

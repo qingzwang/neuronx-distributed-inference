@@ -39,68 +39,46 @@ empty dict and rank-local weights go in through
 **Weights are loaded per rank on the host, not by NxD.** Same reason. This is the
 existing `shard_loader.load_rank_weights` path, unchanged.
 
-STATUS: prefill traces; decode blocked on one unexplained shape error.
-----------------------------------------------------------------------
-Working and verified:
-  * both graphs register as separate keys in one builder
-  * prefill generates HLO cleanly at TP=2 and TP=32 (~5 s)
-  * the shared-cache mechanism itself, on a toy model
-    (test/spike/test_modelbuilder_shared_state.py: decode sees prefill's writes,
-    9.0 vs 5.0 for an isolated cache; re-calling initialize() clears it)
-  * **prefill and decode BOTH generate HLO when driven directly** — calling this
-    module's own `_make_instance()` / `_example_inputs()` under
-    `mock_distributed`, in ModelBuilder's own load-all-then-trace order, with its
-    exact `generate_hlo` flags and `set_aot_mode(True)`. Both come back [ok].
+STATUS: both graphs generate HLO. Needs TP=32 to fit HBM.
+--------------------------------------------------------
+Prefill and decode both trace and reach the compiler. At TP=2 neuronx-cc then
+refuses on capacity, which is expected and not a port bug:
 
-Blocked: the same two instances fail inside `builder.trace()` with
+    [NCC_EVRF009] Size of total input and output tensors exceeds HBM limit of
+    Trainium2. Needed 27,092,869,592 bytes (25 GB) vs available 25,769,803,776
 
-    RuntimeError: The size of tensor a (128) must match the size of
-                  tensor b (0) at non-singleton dimension 0
+283.8 B params in bf16 is 568 GB, so TP=2 leaves ~25 GB per core against a 24 GB
+budget. TP=32 is what the model needs (see the README's per-core arithmetic);
+TP=2 is only useful for fast iteration on graph-level bugs.
 
-pointing at `decode_patches.window_topk_idxs`. Narrowed as far as printing
-inside the driver at the point of failure:
+Four bugs had to be fixed to get here, all verified:
 
-    [WTK] win=128 j=(128,)/128 pos=()/1 bsz=1 cmp=(128,)
-    [WTK] full_like=(128,) mask=(128,)
-    <raise>
+  1. `collectives.py` bound `torch.distributed` at import time. mock_distributed
+     swaps the module object rather than mutating it, so the captured reference
+     reported world_size == 1 at any TP and HF built unsharded modules. Fixed by
+     late binding: world_size 1 -> 2, and all five layer types then traced.
 
-So `j <= pos` evaluates to (128,) and `full_like(j, -1)` to (128,) — every
-operand valid — and then `torch.where(mask, j, fl)` raises about a 0-size
-tensor. Probes placed after that line (`_batch`, and the ops following
-`window_topk_idxs`) never print, so nothing downstream is reached.
+  2. A scalar `start_pos` was dropped from prefill's graph as an unused input
+     ("...will be ignored (index=1, shape=[1], dtype=int32)"). Both graphs share
+     one input signature, so decode lost it too and its `pos` arrived
+     zero-element. Fixed by following NxDI's own convention: position_ids is
+     `(batch, n_active_tokens)`, built like model_wrapper.py:248-251, so both
+     graphs genuinely consume it. The decode forwards take the last entry.
 
-Ruled out by experiment, not by reasoning:
-  * the op in the traceback (it succeeds when forced separately)
-  * `window_topk_idxs` itself (compiles and runs standalone on XLA: (1,1,128),
-    materialises to -125)
-  * 0-d vs (1,)-shaped `start_pos` — both fail here, and 0-d is required anyway
-  * explicit broadcasting of `pos` to j's shape before the compare
-  * device mixing (all xla:0), meta-device init (different error)
-  * cross-key interference (decode fails alone too)
-  * MoE / ParallelHead all_gather (traced clean at TP=2)
-
-Three REAL bugs were found and fixed along the way, each of which produced this
-same symptom and each of which is independently verified:
-  1. `collectives.py` bound `torch.distributed` at import time, before
-     `mock_distributed` swaps the module object, so `get_world_size()` returned 1
-     at any TP. HF then built unsharded modules. Fixed by late binding; confirmed
-     by `world_size` going 1 -> 2 and all five layer types then tracing.
-  2. `start_pos` was dropped from prefill's graph as an unused input
-     ("...will be ignored (index=1, shape=[1], dtype=int32)"), and since both
-     graphs share one input signature, decode lost it too. Fixed by keeping it
-     alive with `+ 0 * start_pos`; the warning is gone.
   3. `compile_neuron._INDEX_HELPER_STATE` is a module global holding only the
-     newest patch, so with two graphs registered the first one's index helpers
-     read a dict nobody writes (device None -> CPU tensors). Fixed with
-     `index_helper_state()` captured per graph; confirmed by prefill going
-     [FAIL] -> [ok] in load-all-then-trace order.
+     newest patch. ModelBuilder loads every key before tracing any, so the first
+     graph's index helpers read a dict nobody writes (device None -> CPU
+     tensors). Fixed with `index_helper_state()` captured per graph.
 
-That the direct-drive harness now passes while `builder.trace()` does not means
-the remaining cause is in what trace() does *around* HLO generation — the most
-likely candidate is that it runs inside a `torch.multiprocessing` worker with
-`file_system` sharing, where the private per-key `model` modules and their
-closures are re-created in a context these fixes have not been checked in.
-Next step: make the failing path print from inside that worker.
+  4. **`torch.where` fails to lower inside ModelBuilder's generate_hlo.** This
+     was the last and least obvious one. `window_topk_idxs` did
+     `where(j <= pos, j, full_like(j, -1))`, which works under
+     parallel_model_trace but raises "size of tensor a (128) must match tensor b
+     (0)" here. Wrapping torch.where to dump its arguments at the raise showed
+     all three operands were (128,), numel 128, int64, xla:0 — nothing wrong with
+     any of them, so the size-0 operand is internal to the lowering. Replaced
+     with the arithmetic equivalent `keep * j - (1 - keep)`, which lowers
+     cleanly and is verified identical for pos in 0, 1, 5, 127, 200.
 
 Usage:
     python src/compile_joint.py --tp 32 --n-layers 5 --seq-len 256 \\
@@ -309,14 +287,17 @@ class _JointWrapper(torch.nn.Module):
         self._raw_forward = raw_forward
         self._helper_state = helper_state
 
-    def forward(self, input_ids, start_pos):
+    def forward(self, input_ids, position_ids):
         import decode_patches
 
         with torch.no_grad():
             sink = decode_patches.build_sink(self.inner, self._hf)
             self._state["active"] = self._mode
             self._state["sink"] = sink
-            self._state["pos"] = start_pos.reshape(())
+            # The scalar position the decode forwards need is the LAST entry of
+            # position_ids. Sliced from the real input so it stays a genuine data
+            # dependency rather than a constant.
+            self._state["pos"] = position_ids[0, -1].reshape(())
 
             # The index helpers build position constants on a device recorded
             # from input_ids by the patched Transformer.forward. We call the
@@ -326,7 +307,7 @@ class _JointWrapper(torch.nn.Module):
             self._helper_state["device"] = input_ids.device
 
             logits = self._raw_forward(self.inner, input_ids,
-                                       start_pos.reshape(()))
+                                       position_ids[0, -1].reshape(()))
 
             if self._mode == "prefill":
                 # Keep start_pos ALIVE in prefill's graph.
@@ -349,7 +330,7 @@ class _JointWrapper(torch.nn.Module):
                 # Adding 0 * start_pos is shape-static, numerically a no-op in
                 # bf16 (start_pos is 0 in prefill anyway), and makes the input a
                 # real data dependency of the output so it survives.
-                logits = logits + (start_pos.reshape(()).to(logits.dtype) * 0)
+                logits = logits + (position_ids.sum().to(logits.dtype) * 0)
 
             outs = [logits]
             for mod, name in self._slots:
@@ -402,21 +383,30 @@ def _make_instance(mode):
 def _example_inputs(mode):
     n_active = 1 if mode == "decode" else _PREFILL_LEN
     ids = torch.zeros(_MAX_BATCH_SIZE, n_active, dtype=torch.long)
-    # start_pos must be 0-d, not shape (1,).
+    # position_ids is (batch, n_active_tokens) — one entry per token, NOT a
+    # scalar. This is how NxDI's own models do it (model_wrapper.py:248-251
+    # builds `arange(n_active).unsqueeze(0).repeat(batch, 1)`), and copying that
+    # shape is what makes the input survive.
     #
-    # A (1,)-shaped int32 input gets mangled somewhere between the flattener and
-    # the HLO: the value reaches the graph as a zero-*element* tensor, so
-    # `j <= pos` broadcasts 128 against 0 and raises "size of tensor a (128) must
-    # match the size of tensor b (0)" inside window_topk_idxs. A 0-d tensor
-    # round-trips correctly. (Both shapes fail while start_pos is also being
-    # dropped as an unused prefill input — fix that first, see _JointWrapper —
-    # which is why this looked shape-independent at first.)
+    # A scalar start_pos cannot work here. Under ModelBuilder both graphs share
+    # one input signature, and prefill's forwards hardcode position 0, so a
+    # scalar is a *dead input* in prefill's trace. NxD drops unused inputs
+    # ("...will be ignored (index=1, shape=[1], dtype=int32)"), decode loses it
+    # from the shared signature too, and its `pos` arrives zero-element — which
+    # surfaces as "size of tensor a (128) must match tensor b (0)" inside
+    # window_topk_idxs, far from the cause. Per-token position_ids is used by
+    # both graphs for real, so nothing gets eliminated.
     #
-    # Decode traces at position 1, not 0: position 0 would exercise the
-    # degenerate case of any pos-derived mask, and decode is only ever entered
-    # at pos >= 1.
-    pos = torch.tensor(1 if mode == "decode" else 0, dtype=torch.int32)
-    return [(ids, pos)]
+    # Decode's single position traces at 1, not 0: position 0 would exercise the
+    # degenerate case of any pos-derived mask, and decode is only entered at
+    # pos >= 1.
+    if mode == "decode":
+        position_ids = torch.ones(_MAX_BATCH_SIZE, 1, dtype=torch.int32)
+    else:
+        position_ids = torch.arange(
+            _PREFILL_LEN, dtype=torch.int32).unsqueeze(0).repeat(
+                _MAX_BATCH_SIZE, 1)
+    return [(ids, position_ids)]
 
 
 def main():
