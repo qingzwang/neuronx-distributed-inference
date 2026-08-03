@@ -176,8 +176,9 @@ comparison against something already trusted, not on "it compiles".
 | 2. init-independent compression ring | **done** | `test_compress_state_mask.py` — 28 ring states x 4 init values, exact (max\|d\| = 0.00e+00) |
 | 1. config + ragged state layout | **done** | `test_dsv4_config.py` — all shapes match HF for 5 layer types; 17 = 17 states vs the validated port |
 | cache manager | **done** | `test_dsv4_kv_cache.py` — alias ordering is a stable bijection; positional convention matches `DecoderModelInstance.get()` |
-| 3. compressor + indexer forwards | next | layer parity vs patched HF, per layer type |
-| 4. MoE + head + model class | | parity at 5 layers |
+| state adapter (forwards -> manager) | **done** | `test_dsv4_state_adapter.py` — logits bit-identical, 17/17 states compared, order verified; mutation tested |
+| 3. compressor + indexer forwards | **done via adapter** | the validated forwards are reused unchanged, not rewritten |
+| 4. MoE + head + model class | next | parity at 5 layers |
 | 5. `NeuronBaseForCausalLM` + compile | | device parity vs the standalone prefill artifact |
 
 Steps 2 and the cache manager landed before step 1's attention work because both
