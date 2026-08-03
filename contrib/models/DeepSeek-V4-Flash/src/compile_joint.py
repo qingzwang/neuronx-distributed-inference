@@ -490,6 +490,14 @@ def main():
     model = builder.trace(initialize_model_weights=False)
     print(f"[joint] traced both graphs in {time.perf_counter() - t0:.1f}s")
 
+    # NOTE: a saved artifact currently cannot be reloaded and run. See
+    # run_joint.py's --compile-and-run: ModelBuilder marks the module as
+    # mock-initialised for jit.trace and clears the flag on the returned object,
+    # but `mock_initialization` is @torch.jit.unused so the cleared state is not
+    # serialised. A reloaded module reports is_initialized() == True, skips the
+    # "not initialized" guard, and returns untouched output buffers -- all-zero
+    # logits, no NEFF loaded. Saving is still useful to keep the compile result,
+    # but inference has to happen in the compiling process for now.
     torch.jit.save(model, os.path.join(args.out_dir, "joint_model.pt"))
     with open(os.path.join(args.out_dir, "config.json"), "w") as f:
         json.dump({
