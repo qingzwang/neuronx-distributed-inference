@@ -84,8 +84,18 @@ register_buffer("score_state", torch.full(..., float("-inf")))   # model.py:304
 It is consumed by `softmax(dim=1)` over the compression ring, so an unwritten
 slot must contribute *zero weight*. Zero-initialising makes it contribute
 `exp(0)` — a uniform vote for a slot holding no data. Measured effect of getting
-this wrong: **2x magnitude error** on the compressed output (absmean 0.62 vs
-0.31), silently, with finite values throughout.
+this wrong (test_compress_state_mask.py): **33% to 90% relative error** on the
+compressed output, silently, with finite values throughout. The error grows as the
+ring empties, so it is worst at the *start* of every sequence — exactly where a
+short prompt or a fresh decode step sits:
+
+| written / ring slots | mean relative error |
+|---|---|
+| 6/8 | 33% |
+| 5/8 | 43% |
+| 3/8 | 66% |
+| 2/8 | 79% |
+| 1/8 | 90% |
 
 This is the one constraint the framework actively fights: NxD's `StateInitializer`
 hardcodes `torch.zeros` (base_nxd_model.py:31) and is what builds device state on
