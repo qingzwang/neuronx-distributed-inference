@@ -249,7 +249,12 @@ def main():
             raise SystemExit("[FAIL] every weight is zero; the load did not work")
 
     t0 = time.perf_counter()
-    model.nxd_model.initialize(per_rank, torch.tensor(0))
+    # start_rank_tensor is shape (1,), matching NxDI's own call
+    # (application_base.py:414: torch.tensor([start_rank_id], dtype=torch.int32,
+    # device="cpu")). It is consumed by torch.ops.aten.Int(), so a 0-d tensor is
+    # not interchangeable here.
+    start_rank_tensor = torch.tensor([0], dtype=torch.int32, device="cpu")
+    model.nxd_model.initialize(per_rank, start_rank_tensor)
     print(f"[joint] initialize() (weights + shared state onto device) in "
           f"{time.perf_counter() - t0:.1f}s", flush=True)
 
