@@ -298,7 +298,25 @@ class DSV4Model(torch.nn.Module):
             patch_state = self._hf._dsv4_patch_state
             patch_state["sink"] = sink
             patch_state["active"] = self.mode
-            pos = position_ids[0, -1].reshape(())
+            # The scalar position each mode needs is NOT the same entry.
+            #
+            # decode processes one token at absolute position p, so it wants the
+            # last (only) entry. prefill processes the whole prompt starting AT
+            # ZERO -- its forwards slice freqs_cis[0:seqlen] and derive every
+            # compressor/window index from a start of 0. Feeding it
+            # position_ids[0, -1] = 127 instead made prefill run as if the prompt
+            # began at 127: freqs_cis got the wrong slice and the compressor's
+            # freq_idx = (pos + 1 - ratio) was wrong for every entry, which came
+            # out as NaN logits on CPU and all-zero logits on device (the device
+            # reports non-finite as zero).
+            #
+            # This was the actual cause of the "graph does not execute" symptom.
+            # The graph executed the whole time; it was computing garbage.
+            if self.mode == "prefill":
+                pos = torch.zeros((), dtype=torch.int32,
+                                  device=position_ids.device)
+            else:
+                pos = position_ids[0, -1].reshape(())
             patch_state["pos"] = pos
 
             # The index helpers build their position constants on a device read

@@ -344,10 +344,46 @@ def main():
     except Exception as e:
         print(f"[dev] mock_initialization not callable: {type(e).__name__}")
 
+    # Measure what actually lands on device. _parallel_load is verified to work in
+    # isolation (moves tensors to privateuseone:N for any key form), so if
+    # nxd_model.weights comes back empty or on the host after initialize(), the
+    # problem is upstream of the transfer primitive.
     t0 = time.perf_counter()
     traced.nxd_model.initialize(
         per_rank, torch.tensor([0], dtype=torch.int32, device="cpu"))
     print(f"[dev] initialize() in {time.perf_counter() - t0:.1f}s", flush=True)
+    # The decisive check: does the underlying SPMDModel report initialised?
+    # A fresh jit.load reports False and forward() then raises "not initialized".
+    # If it is STILL False after our initialize() -- while nxd_model.weights and
+    # .state are correctly on device -- then initialize() bound the wrapper's
+    # tensors but never handed them to the NEFF, and forward() silently returns
+    # the zero placeholder from NxDModel.forward's `result` initialisation instead
+    # of raising, because the guard lives in SPMDBucketModelScript.
+    try:
+        _bm = list(traced.nxd_model.models.named_children())[0]
+        _mm = _bm[1].models[0]
+        print(f"[dev] SPMD '{_bm[0]}' is_initialized AFTER initialize(): "
+              f"{_mm.is_initialized()}")
+    except Exception as e:
+        print(f"[dev] SPMD probe failed: {type(e).__name__}: {e}")
+
+    try:
+        w = traced.nxd_model.weights
+        st = traced.nxd_model.state
+        print(f"[dev] after initialize: weights={len(w)} ranks, "
+              f"state={len(st)} ranks")
+        if len(w) and hasattr(w[0], "keys") and len(w[0]):
+            k = sorted(w[0].keys())[0]
+            t = w[0][k]
+            print(f"[dev]   weights[0][{k!r}] device={t.device} "
+                  f"shape={tuple(t.shape)}")
+        else:
+            print(f"[dev]   weights[0] is EMPTY -> nothing was transferred")
+        if len(st) and hasattr(st[0], "keys") and len(st[0]):
+            k = sorted(st[0].keys())[0]
+            print(f"[dev]   state[0][{k!r}] device={st[0][k].device}")
+    except Exception as e:
+        print(f"[dev] could not inspect weights/state: {type(e).__name__}: {e}")
 
     # Is the SPMD model actually initialised after our initialize()? A fresh
     # jit.load raises "not initialized" on forward, so the guard does work -- if it

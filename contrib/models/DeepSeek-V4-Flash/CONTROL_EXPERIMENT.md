@@ -155,3 +155,53 @@ should start.
 
 Also tested and ruled out this round: `int32` vs `int64` `input_ids`, matching
 NxDI's own input generator (model_wrapper.py:245). No change.
+
+
+## Breakthrough: it was never a loading problem — the graph computes NaN
+
+The decisive experiment was finally the cheap one: run **the same graph on CPU**
+with the same weights and inputs the device gets.
+
+```
+CPU logits: absmax nan  std nan  finite False
+```
+
+So `DSV4Model.forward` produces **NaN**, not zeros. The device reports non-finite
+as zero, which is why every device-side symptom looked like "the NEFF never ran".
+It ran the whole time and computed garbage.
+
+That also retires the entire loading-boundary investigation. For the record, all of
+these were verified *correct* and none was the cause:
+
+* weights on device (`privateuseone:0`, shape (4040, 4096) i.e. properly sharded)
+* state on device (32 ranks x 17 states, keyed `kv_mgr.past_key_values.N`)
+* `is_initialized()` == **True** after our `initialize()` (False on a fresh load,
+  and `forward` correctly raises there — so the guard works)
+* all 207 graph weight names reconcile, 0 missing
+* router returns `('prefill', 0)`; flattener returns the 2 expected tensors
+* `_parallel_load` moves tensors to device for any key form
+
+Two of my earlier conclusions were wrong and are corrected here:
+
+* **"initialize() never transfers weights."** It does. The 5.2 s vs Qwen3's 12.0 s
+  timing argument was not evidence of a missing transfer — inspecting
+  `nxd_model.weights` after the call shows real tensors on `privateuseone:0`.
+* **"the graph does not execute."** It executes.
+
+## Where the NaN is, so far
+
+Narrowed by bisection at 3 layers, real weights, TP=32, under `mock_distributed`:
+
+| probe | result |
+|---|---|
+| embed | finite |
+| layers 0,1,2 individually, in sequence | finite (absmax 2.06 / 3.19 / 2.92) |
+| `hc_head`, `norm`, `get_logits` called step by step | finite (absmax 3.11 / 2.52) |
+| the head's `all_gather` + concat, reproduced by hand | finite, shape (1, 129280) |
+| **stack + head in one pass** (`inner.head(...)`, raw `Transformer.forward`, and `DSV4Model.forward`) | **NaN, all three** |
+
+So every component is finite in isolation and the composition is not, which points
+at state left behind by one pass being consumed by the next — the managed sink is
+rebuilt per call, and a probe that rebuilds it between the stack and the head gets
+a different (clean) ring than a single pass does. That is the next thing to test:
+whether the head is reading ring state the stack has already rolled.
