@@ -407,6 +407,24 @@ def main():
         # `model.model.nxd_model.forward(example)` for the same reason
         # (application_base.py:363).
         out = traced.nxd_model.forward([inp, pos])
+        # The graph DOES execute (the aliased state comes back written), but
+        # out[0] is exact zeros. The packer returns (logits, *state) and NxD's
+        # aliasing writes state outputs back over their inputs -- so an aliased
+        # output may be returned as a zero placeholder while the real value lands
+        # in the state buffer. If logits itself got aliased, out[0] would be that
+        # placeholder. Print the whole structure to find where the real logits are.
+        if os.environ.get("DSV4_OUT_DEBUG") == "1":
+            print(f"[out] type={type(out).__name__} "
+                  f"len={len(out) if hasattr(out, '__len__') else 'n/a'}",
+                  flush=True)
+        if os.environ.get("DSV4_OUT_DEBUG") == "1" and isinstance(out, (tuple, list)):
+            print(f"[out] {len(out)} outputs:", flush=True)
+            for i, t in enumerate(out[:20]):
+                if hasattr(t, "shape"):
+                    tt = t.float()
+                    print(f"   [{i:>2}] {tuple(t.shape)} nonzero="
+                          f"{int((tt != 0).sum())}/{t.numel()} "
+                          f"absmax={float(tt.abs().max()):.4f}", flush=True)
         while isinstance(out, (tuple, list)):
             out = out[0]
         return out
@@ -417,6 +435,24 @@ def main():
     ttft = time.perf_counter() - t0
     row = logits[0].float()
     print(f"[dev] TTFT {ttft:.2f}s")
+    # Characterise the output precisely. "All zero" and "all NaN reported as zero"
+    # and "uninitialised buffer" look the same through absmax alone.
+    raw = logits[0]
+    print(f"[dev] raw dtype={raw.dtype} n_zero={int((raw == 0).sum())}/{raw.numel()} "
+          f"n_nan={int(torch.isnan(raw).sum())} n_inf={int(torch.isinf(raw).sum())} "
+          f"unique={int(torch.unique(raw).numel())}")
+    # And the aliased state: if the graph ran, the caches must have been written.
+    try:
+        st = traced.nxd_model.state
+        nz = 0
+        for i in range(min(3, len(st[0]))):
+            k = sorted(st[0].keys())[i]
+            t = st[0][k].detach().cpu()
+            nz += int((t != 0).sum())
+            print(f"[dev]   state {k}: nonzero={int((t != 0).sum())}/{t.numel()}")
+        print(f"[dev] -> state {'WAS' if nz else 'was NOT'} written by the graph")
+    except Exception as e:
+        print(f"[dev] state inspect failed: {type(e).__name__}: {e}")
     print(f"[dev] logits: finite={bool(torch.isfinite(row).all())} "
           f"absmax={float(row.abs().max()):.3f} std={float(row.std()):.3f}")
     if float(row.abs().max()) == 0.0:

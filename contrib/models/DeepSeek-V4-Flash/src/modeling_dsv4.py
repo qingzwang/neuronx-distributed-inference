@@ -328,10 +328,24 @@ class DSV4Model(torch.nn.Module):
             logits = self._raw_forward(self.inner, input_ids, pos)
 
             if self.mode == "prefill":
-                # Keep position_ids alive in prefill's graph. Prefill ignores the
-                # position, so without a data dependency NxD drops the input and
-                # decode loses it from the shared signature too.
-                logits = logits + (position_ids.sum().to(logits.dtype) * 0)
+                # Keep position_ids alive in prefill's graph WITHOUT multiplying by
+                # zero.
+                #
+                # The previous form was `logits + position_ids.sum() * 0`, which is
+                # a mathematical no-op but is also exactly the pattern a compiler
+                # constant-folds: `x * 0 -> 0`, then `logits + 0 -> logits`, and the
+                # input dependency it was supposed to create disappears again. Worse,
+                # on device the whole prefill output came back as exact zeros with
+                # the aliased state correctly written -- i.e. the graph ran, and only
+                # the logits output was dead.
+                #
+                # Instead make position_ids feed the result through a path that
+                # cannot be folded away: subtract its own first element, which is
+                # provably 0 for prefill (position_ids = arange(seqlen)) but is not a
+                # literal the compiler can prove without evaluating the input.
+                zero_from_pos = (position_ids[0, 0] - position_ids[0, 0]).to(
+                    logits.dtype)
+                logits = logits + zero_from_pos
 
             outs = [logits] + dsv4_state_adapter.collect_outputs(
                 sink, self.kv_mgr, self._state_map)

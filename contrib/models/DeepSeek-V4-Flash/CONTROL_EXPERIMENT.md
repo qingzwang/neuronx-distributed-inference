@@ -242,3 +242,55 @@ Also worth recording as a methodological note, since it cost time twice: a
 single-process CPU run of a TP>1 model under `mock_distributed` is **not** a valid
 correctness reference. It was used here to "prove" NaN and earlier to reason about
 transfer timings. Any CPU parity check for this port has to run at TP=1.
+
+
+## The graph DOES execute — only the logits output is dead
+
+Characterising the device output properly settled what "all-zero logits" means:
+
+```
+raw dtype=float32  n_zero=129280/129280  n_nan=0  n_inf=0  unique=1
+state kv_mgr.past_key_values.0: nonzero=50688/65536
+state kv_mgr.past_key_values.1: nonzero=64512/65536
+-> state WAS written by the graph
+```
+
+So the NEFF ran, did real work, and wrote the aliased KV state. Exactly one thing
+is wrong: output 0 (the logits) comes back as exact zeros — one unique value, no
+NaN, no inf, i.e. an untouched output buffer rather than a computed-then-broken
+value.
+
+This reframes everything. It is not a loading problem (weights and state verified
+on device), not a dispatch problem (router/flattener verified), not a NaN problem
+(that was a TP=32-on-one-rank artifact), and not "the graph does not execute". It is
+specifically: **the logits output is not written by the compiled graph.**
+
+Consistent with that reading:
+
+* `nxd_model.forward` returns a single `Tensor`, not a tuple. That is correct —
+  `ModelBuilder` passes `output_aliased_tensor=False`, so `return_aliases=False`
+  and the runtime strips all 17 aliased state outputs, returning only output 0.
+* the alias map is verified to claim indices 1..17 only, leaving output 0 free.
+
+So output 0 is declared, unaliased, and never written.
+
+### Ruled out for the dead output
+
+* **The prefill keep-alive multiplied by zero.** `logits + position_ids.sum() * 0`
+  is a no-op mathematically but is also exactly what a compiler constant-folds
+  (`x*0 -> 0`, `logits+0 -> logits`), which would both defeat the input-liveness
+  trick it existed for and plausibly kill the output. Replaced with
+  `position_ids[0,0] - position_ids[0,0]`, which is provably zero for
+  `arange(seqlen)` but not a literal the compiler can fold without evaluating the
+  input. **No change** — still all zeros. So this was a real latent bug worth
+  fixing, but not the cause.
+* TP=1 as a way to remove collectives from the picture: not possible, one core
+  cannot hold the unsharded model (`Failed to allocate nrt tensor`).
+
+### Next
+
+The remaining candidates all concern how output 0 is produced rather than
+consumed: whether `DSV4Model.forward` returning `tuple(outs)` with 18 entries maps
+output 0 to the logits the packer expects, and whether the packer built at trace
+time (from the *prefill* graph's example run) agrees with what decode returns. Both
+are inspectable in the HLO's output signature without another device run.
