@@ -274,6 +274,7 @@ class DSV4Model(torch.nn.Module):
 
         self._state_map = dsv4_state_adapter.build_state_map(
             hf_model, hf_mod, self.layer_kinds)
+
         self._raw_forward = getattr(hf_mod.Transformer.forward, "__wrapped__",
                                     hf_mod.Transformer.forward)
 
@@ -347,6 +348,28 @@ class DSV4Model(torch.nn.Module):
                     logits.dtype)
                 logits = logits + zero_from_pos
 
-            outs = [logits] + dsv4_state_adapter.collect_outputs(
+            # Return logits TWICE, and alias the state from index 2 onward.
+            #
+            # Diagnostic for the dead output-0: the metaneff shows out[0] declared
+            # [1, 129280] float32 and unaliased, outputs 1..17 aliased to the state
+            # inputs, and on device the state comes back WRITTEN while out[0] is an
+            # untouched buffer. If out[1] (the duplicate) comes back with real
+            # values while out[0] stays zero, the problem is specific to position 0
+            # of the root tuple. If both are zero, the logits value itself never
+            # reaches the root.
+            state_outs = dsv4_state_adapter.collect_outputs(
                 sink, self.kv_mgr, self._state_map)
-            return tuple(outs)
+
+            # `logits` may be a view/slice of a tensor that also feeds an aliased
+            # state output (ParallelHead.get_logits does F.linear(x[:, -1], w), and
+            # `x` descends from the same activations the caches were written from).
+            # An aliased output is written IN PLACE over its input buffer, so if
+            # output 0 shares storage with any aliased buffer the runtime can
+            # clobber it -- which matches the observation exactly: state written,
+            # logits an untouched-looking zero buffer.
+            #
+            # `.contiguous()` alone is not enough: it is a no-op when the tensor is
+            # already contiguous, which a linear's output is. Force a fresh
+            # allocation the aliasing cannot reach.
+            logits = logits.clone()
+            return tuple([logits] + state_outs)

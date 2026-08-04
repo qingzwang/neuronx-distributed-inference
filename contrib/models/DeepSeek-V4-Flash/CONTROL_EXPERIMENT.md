@@ -294,3 +294,55 @@ consumed: whether `DSV4Model.forward` returning `tuple(outs)` with 18 entries ma
 output 0 to the logits the packer expects, and whether the packer built at trace
 time (from the *prefill* graph's example run) agrees with what decode returns. Both
 are inspectable in the HLO's output signature without another device run.
+
+
+## Metaneff confirms output 0 is correctly declared
+
+Static inspection of `prefill/_tp0_bk0/metaneff.pb`, no device time:
+
+```
+return_aliases: False
+n input_tensors:  226
+n output_tensors:  18
+output_aliases_to: {1: 2, 2: 3, ..., 17: 18}
+
+out[0]  output0  dims=[1, 129280]  type=1 (float32)
+out[1]  output1  dims=[1, 128, 512] type=14 (bf16)
+...
+out[17] output17 dims=[1, 8, 256]  type=1
+```
+
+Everything here is right. Output 0 is the logits, correct shape and dtype, and it
+is **not** in `output_aliases_to` — the 17 aliases map outputs 1..17 to inputs
+2..18, which is exactly what `hlo_conversion.py:490` generates
+(`output_idx -> i + n_user_inputs`, with 2 user inputs). `return_aliases: False`
+explains why `forward` returns a bare Tensor rather than a tuple: the runtime
+strips the aliased outputs and hands back only output 0.
+
+So the contract is correct end to end and output 0 is simply never written.
+
+Two more hypotheses tested and eliminated:
+
+* **Output slot 0 being special.** Returned `logits` twice with the aliases shifted
+  to start at 2. The compiler rejected it outright — "Trying to set up alias at
+  {18}", i.e. out of range for 19 outputs. Useful negative result: aliasing is
+  strictly index-checked, so the normal 1..17 configuration is definitely valid.
+* **`logits` sharing storage with an aliased buffer.** An aliased output is written
+  in place over its input, so if output 0 aliased the same storage as a cache the
+  runtime could clobber it — which would match "state written, logits untouched"
+  precisely. Added `logits.clone()` to force a fresh allocation (`.contiguous()`
+  would be a no-op here). **No change.**
+
+### Status
+
+Everything checkable is correct: weights and state on device, `is_initialized()`
+True, router and flattener verified, alias map verified against the generator, the
+metaneff signature verified, the graph demonstrably executing and writing 17/17
+state buffers. Output 0 alone comes back as an untouched buffer, and the cause is
+not any of: loading, dispatch, aliasing indices, alias storage overlap, output
+position, NaN, dead-code elimination via `*0`, weight naming, weight layout,
+example-input degeneracy, compiler version, or the compile cache.
+
+The next thing I would do is dump the HLO text for the prefill graph and read what
+instruction feeds root tuple element 0 — that is the one remaining place the answer
+can be, and it is static.
