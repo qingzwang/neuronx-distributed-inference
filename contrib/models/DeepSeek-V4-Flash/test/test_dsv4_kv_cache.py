@@ -104,7 +104,7 @@ def main():
     hf_model = hf.Transformer(hf.ModelArgs(**raw)).eval()
     torch.set_default_dtype(torch.float32)
 
-    worst = None
+    worst, dtype_bad = None, None
     for layer_idx, name in order:
         attn = hf_model.layers[layer_idx].attn
         obj = attn
@@ -115,8 +115,18 @@ def main():
         if tuple(mine.shape) != tuple(hf_buf.shape):
             worst = (layer_idx, name, tuple(mine.shape), tuple(hf_buf.shape))
             break
+        if mine.dtype != hf_buf.dtype:
+            dtype_bad = (layer_idx, name, mine.dtype, hf_buf.dtype)
+            break
     check(worst is None, "every published state matches HF's buffer shape",
           "" if worst is None else f"{worst[0]}.{worst[1]}: {worst[2]} vs {worst[3]}")
+    # dtype is not uniform: HF keeps the compressor rings in fp32 while the KV
+    # caches are bf16, because compression runs in fp32. Allocating everything
+    # bf16 fails at the first ring write with an index_copy dtype mismatch -- a
+    # loud error, but the check belongs here rather than at first use.
+    check(dtype_bad is None, "every published state matches HF's buffer dtype",
+          "" if dtype_bad is None
+          else f"{dtype_bad[0]}.{dtype_bad[1]}: {dtype_bad[2]} vs {dtype_bad[3]}")
 
     print("\n=== 5. init values are safe given in-graph masking ===")
     all_zero = all(float(t.abs().sum()) == 0.0 for t in mgr.past_key_values)

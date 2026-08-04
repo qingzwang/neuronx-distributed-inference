@@ -67,10 +67,14 @@ class DSV4CacheManager(nn.Module):
         self._shapes: List[Tuple[int, ...]] = []
 
         for kind in layer_kinds:
-            for name, shape, init in kind.state_specs():
+            for name, shape, init, want_dtype in kind.state_specs():
                 full = (batch_size,) + tuple(shape)
-                t = torch.zeros(full, dtype=dtype) if init == 0.0 else \
-                    torch.full(full, init, dtype=dtype)
+                # dtype is per state: HF keeps the KV caches in the model dtype
+                # but the compressor rings in float32, because compression runs
+                # in fp32. `None` means "use the model dtype".
+                d = want_dtype or dtype
+                t = torch.zeros(full, dtype=d) if init == 0.0 else \
+                    torch.full(full, init, dtype=d)
                 self._index[(kind.layer_idx, name)] = len(params)
                 self._shapes.append(full)
                 params.append(nn.Parameter(t, requires_grad=False))
@@ -139,7 +143,5 @@ class DSV4CacheManager(nn.Module):
         return "\n".join(lines)
 
     def total_bytes(self) -> int:
-        elem = torch.empty((), dtype=self.dtype).element_size()
-        return sum(
-            elem * int(torch.tensor(s).prod()) for s in self._shapes
-        )
+        # Per-tensor element size: the rings are fp32 while the caches are bf16.
+        return sum(t.numel() * t.element_size() for t in self.past_key_values)

@@ -178,12 +178,32 @@ comparison against something already trusted, not on "it compiles".
 | cache manager | **done** | `test_dsv4_kv_cache.py` — alias ordering is a stable bijection; positional convention matches `DecoderModelInstance.get()` |
 | state adapter (forwards -> manager) | **done** | `test_dsv4_state_adapter.py` — logits bit-identical, 17/17 states compared, order verified; mutation tested |
 | 3. compressor + indexer forwards | **done via adapter** | the validated forwards are reused unchanged, not rewritten |
-| 4. MoE + head + model class | next | parity at 5 layers |
-| 5. `NeuronBaseForCausalLM` + compile | | device parity vs the standalone prefill artifact |
+| 4. MoE + head + model class | **done** | `test_dsv4_model.py` — prefill AND decode logits rel=0.00e+00; alias map consistent; mode dispatch verified to switch branches |
+| 5. compile at TP=32 via the framework | next | device parity vs the standalone prefill artifact |
 
 Steps 2 and the cache manager landed before step 1's attention work because both
 are prerequisites for it: the attention forwards read state through the manager and
 mask through `compress_state`, so their contracts had to be pinned first.
+
+## Departure from the plan: no `NeuronBaseModel` subclass
+
+The plan said "subclass NxDI's model base". On contact with the contract that
+turned out to buy nothing, so `DSV4Model` is a plain `nn.Module`.
+
+`NeuronBaseModel.__init__` requires `init_model` to publish
+`embed_tokens`/`layers`/`norm`/`lm_head`, and its `forward` then drives them
+through `NeuronAttentionBase`-shaped layers with a `KVCacheManager`. This model
+matches none of that: HF names them `embed`/`head`, `head` takes five arguments
+(hyper-connection mixing) and returns only the last position, and
+`Attention.forward(x, start_pos)` is a custom `sparse_attn` kernel over a window
+plus compressed tail. Subclassing would mean renaming things to satisfy a contract
+and then overriding every method that uses them.
+
+What the framework is actually needed for is the *tracing* side — two graphs
+registered against one shared cache, alias generation, NEFF loading — and that is
+driven by `BaseModelInstance` plus the alias map, not by inheritance. So
+`DSV4Model` exposes exactly what the tracing side reads (`past_key_values`, and a
+forward returning `(logits, *state)` in the manager's order) and nothing else.
 
 ## Order of work
 
