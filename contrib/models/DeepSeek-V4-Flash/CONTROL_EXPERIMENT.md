@@ -419,3 +419,45 @@ vocab shard. So `xm.all_gather` is not combining ranks yet; passing
 `groups` derived from the TP group's `_mesh` did not change it. The generated text
 is correspondingly wrong (`'\ufffd\ufffdactionix'`), which is expected while 31/32
 of the vocab is missing. That is the next thing to fix and it is a narrow one.
+
+
+## The gather is now complete: `pin_layout=False`
+
+`xm.all_gather` with `groups` set but `pin_layout` at its default `True` still
+produced a local copy — exactly `4040 = 129280/32` non-zero entries. NxD's own
+`ColumnParallelLinear` passes `pin_layout=False`
+(`parallel_layers/mappings.py:96`), and its `comm.all_gather` wrapper also resolves
+a `ProcessGroup` to its replica mesh for you. Using that wrapper instead of calling
+`xm.all_gather` by hand:
+
+```python
+from neuronx_distributed.parallel_layers.comm import all_gather as nxd_all_gather
+logits = nxd_all_gather(logits, dim=-1, groups=tp_group(),
+                        pin_layout=False).contiguous()
+```
+
+| | before | after |
+|---|---|---|
+| non-zero logits | 4040 / 129280 (one shard) | **129280 / 129280** |
+| unique values | 4041 | **129143** |
+| absmax / std | 79.56 / 4.41 | 23.51 / 3.42 |
+| TTFT | 0.28 s | 0.29 s |
+| decode | 10-11 ms/token | 10-11 ms/token |
+
+So the full vocabulary is now gathered across all 32 ranks and the output is a
+real distribution.
+
+### Output quality is not yet verifiable at this size
+
+The generated text is wrong (`'ENTIAL hilabihan hilabihan...'`), but that is **not
+evidence of a bug**: this graph is **5 layers**, and the `' Paris'` baseline is the
+**43-layer** standalone artifact. A 5-layer truncation of a 43-layer model is not
+expected to answer the question. Comparing the two is a category error, and I nearly
+made it.
+
+The valid next comparisons, in order:
+
+1. 5-layer joint prefill vs the existing 5-layer *decode* artifact
+   (`dsv4_decode_tp32_L5`) on the same prompt — same depth, so the logits should
+   agree to bf16 tolerance. This is the real correctness gate for the joint path.
+2. Then compile the joint graph at 43 layers and check for `' Paris'` at ~25.5.

@@ -181,20 +181,17 @@ def patch_parallel_head_all_gather(hf_mod):
             #
             # xm.all_gather over dim=-1 reproduces HF's `cat(all_logits, dim=-1)`
             # directly, so no reshape gymnastics are needed either.
-            import torch_xla.core.xla_model as xm
-            # `groups` must be the TP replica mesh. Without it xm.all_gather
-            # degenerates to a local copy: the output came back with exactly
-            # 4040 = 129280/32 non-zero entries, i.e. only this rank's own vocab
-            # shard, the rest untouched.
-            #
-            # Under mock_distributed the TP group is a MagicMock carrying `_mesh`,
-            # which is where NxD's own layers read their replica groups from.
-            groups = None
-            g = tp_group()
-            mesh = getattr(g, "_mesh", None)
-            if mesh is not None:
-                groups = [list(m) for m in mesh]
-            logits = xm.all_gather(logits, dim=-1, groups=groups)
+            # Use NxD's own wrapper rather than calling xm.all_gather directly.
+            # It resolves a ProcessGroup to its replica mesh via _get_group_mesh
+            # and, importantly, passes pin_layout=False — which is what NxD's
+            # ColumnParallelLinear does (parallel_layers/mappings.py:96). Calling
+            # xm.all_gather by hand with pin_layout at its default True left the
+            # output with exactly 4040 = 129280/32 non-zero entries, i.e. only this
+            # rank's own vocab shard: the collective degenerated to a local copy.
+            from neuronx_distributed.parallel_layers.comm import all_gather as nxd_all_gather
+            logits = nxd_all_gather(
+                logits, dim=-1, groups=tp_group(), pin_layout=False,
+            ).contiguous()
         return logits
 
     hf_mod.ParallelHead.forward = parallel_head_forward
