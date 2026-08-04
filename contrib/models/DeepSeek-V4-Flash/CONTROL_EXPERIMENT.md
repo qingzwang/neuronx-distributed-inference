@@ -126,3 +126,32 @@ Two inputs differences also stand out and are cheap to try next:
 `input_ids` is int32 in NxDI's own input generator (ours is int64), and NxDI passes
 seven inputs including `seq_ids` and `sampling_params`. Neither should matter given
 routing succeeds, but "should not matter" has been wrong twice already here.
+
+
+## Quantitative evidence that initialize() does not transfer
+
+The strongest signal yet, and it is arithmetic rather than another hypothesis.
+Comparing our `initialize()` against the working control's weight load:
+
+| | per-rank weights | ranks | time |
+|---|---|---|---|
+| Qwen3-1.7B (works) | ~0.42 GB | 8 | **12.0 s** |
+| DSV4 5 layers (zeros) | ~2.06 GB | 32 | **5.2 s** |
+
+We hand over 4.9x the data per rank and it completes in 43% of the time — an ~11x
+apparent transfer-rate difference. Combined with `neuron-monitor` reporting zero
+runtimes during the subsequent call, the conclusion is that our `initialize()`
+returns without moving weights to the device, despite:
+
+* accepting the dict without error
+* validating shapes (proven: a wrong-shape dict from `shard_checkpoint()` raises
+  "Incorrect tensor shape at ... received 129280 4096, expected 4040 4096")
+* reconciling all 207 graph weight names (0 missing)
+
+So the weights are correctly shaped and correctly named, the call validates them,
+and it still does not put them on the device. That is a narrower and more testable
+statement than "the graph does not execute", and it is where the next session
+should start.
+
+Also tested and ruled out this round: `int32` vs `int64` `input_ids`, matching
+NxDI's own input generator (model_wrapper.py:245). No change.

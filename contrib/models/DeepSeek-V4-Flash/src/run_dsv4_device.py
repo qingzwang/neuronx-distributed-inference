@@ -180,7 +180,7 @@ def _example_inputs(mode):
     #   status=1006 Execution Out-Of-Bounds Memory Access
     # Spread the example ids across the vocab so every rank traces the general
     # case. The values do not matter otherwise; only the shapes are recorded.
-    ids = (torch.arange(n_active, dtype=torch.long) * 977 + 101) % 129280
+    ids = (torch.arange(n_active, dtype=torch.int32) * 977 + 101) % 129280
     ids = ids.unsqueeze(0).repeat(_BATCH, 1)
     if mode == "decode":
         pos = torch.ones(_BATCH, 1, dtype=torch.int32)
@@ -361,7 +361,7 @@ def main():
         print(f"[dev] could not query is_initialized: {type(e).__name__}: {e}")
 
     def call(token_ids, positions):
-        inp = torch.tensor([token_ids], dtype=torch.long)
+        inp = torch.tensor([token_ids], dtype=torch.int32)
         pos = torch.tensor([positions], dtype=torch.int32)
         # Call nxd_model directly, NOT the traced NxDModelExecutor wrapper.
         # `traced` came out of torch.jit.trace, which recorded the ops of ONE
