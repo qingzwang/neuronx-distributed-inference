@@ -4,58 +4,50 @@
 
 """Compile DSV4Model's two graphs against one shared cache, and verify on device.
 
-STATUS: compiles and binds correctly; execution still returns all-zero logits.
-------------------------------------------------------------------------------
+STATUS: compiles and binds correctly; execution returns all-zero logits.
+-----------------------------------------------------------------------
 Working, with evidence:
   * both graphs compile at TP=32, 2/2 Compiler status PASS, ~114 s
-  * state binding is correct: state_initializer yields 32 ranks x 17 states,
-    keyed kv_mgr.past_key_values.N
-  * weight binding is correct: 0 of 207 graph weights missing, initialize()
-    returns without error
-  * all five CPU gates upstream of this are bit-identical to the validated path
+  * state binding correct: state_initializer yields 32 ranks x 17 states, keyed
+    kv_mgr.past_key_values.N
+  * weight binding correct: 0 of 207 graph weights missing; reconciliation printed
+  * initialize() returns without error
+  * all five CPU gates upstream are bit-identical to the validated patched-HF path
 
-Not working: TTFT 0.03 s (impossibly fast for 5 layers), every logit exactly 0.0,
-and neuron-monitor reports ZERO runtimes during the call -- no NEFF on any core.
-The C++ is_initialized() returns True (the "not initialized" guard does not fire),
-so something reports ready without having loaded.
+Not working: TTFT 0.03 s (impossible for 5 layers), every logit exactly 0.0, and
+neuron-monitor reports ZERO runtimes during the call -- no NEFF on any core, while
+the C++ is_initialized() returns True so the "not initialized" guard never fires.
 
-Ruled out here, each by direct test rather than reasoning:
-  * weight key naming -- fixed, see the dual-form note in _rank_weights below
-  * degenerate example ids -- fixed, see _example_inputs
-  * a poisoned compiler cache (only graph.neff present, no model.MODULE_*.neff);
-    cleared, recompiled from scratch, same result
-  * a stale mock_initialization flag; cleared explicitly, same result
-  * state_initializer missing or mis-keyed; verified present and correct
+Ruled out, each by direct experiment:
+  * weight key naming -- was a real bug (HLO uses '->', runtime uses '.'); fixed,
+    both forms now supplied, 0 missing confirmed
+  * degenerate example ids -- was a real bug (all-zero ids put every token in rank
+    0's vocab shard); fixed, was surfacing as status=1006
+  * a poisoned compiler cache from the neuronx-cc 2.25 experiment (cache hits with
+    only graph.neff, no model.MODULE_*.neff); cleared and recompiled
+  * a stale mock_initialization flag; cleared explicitly
+  * calling the traced NxDModelExecutor instead of nxd_model.forward directly
+    (which is what NxDI's warmup does); switched, no change
+  * save / del / jit.load, i.e. NxDI's own compile-then-load sequence rather than
+    running the in-process traced object; adopted, no change
+  * the ModelBuilder path itself: the toy shared-cache spike
+    (test/spike/test_modelbuilder_shared_state.py) runs correctly on this exact
+    path and SDK, producing real values and a genuinely shared cache
 
-Next: find what actually transfers a NEFF to the cores on the ModelBuilder path.
-TensorParallelNeuronModel._load() does _load_collectives_neuron +
-move_trace_to_device (trace.py:75-105); nothing equivalent appears to run here, and
-NxDI's own application_base only calls nxd_model.initialize(). Comparing against a
-working NxDI model end-to-end on this same SDK would isolate whether this is our
-integration or the path itself.
+So the mechanism works and the numerics work; something specific to this model's
+graph is not executing. The remaining untested difference against NxDI's flow is
+that GLM-5.2 goes through NeuronBaseForCausalLM.load(), which additionally calls
+set_env_vars() and warmup() and populates model_wrapper.model for each registered
+model -- this driver constructs none of that scaffolding.
 
-
-Design step 5. Everything up to here was gated on CPU numerics (all five gates
-bit-identical to the validated patched-HF path), so this is the first thing that
-touches hardware — deliberately, because the previous attempt compiled first and
-spent a long time debugging a graph whose numerics had never been checked.
-
-Compiles in-process and runs in the same process. A saved artifact cannot be
-reloaded and run: ModelBuilder marks the module mock-initialised for jit.trace and
-clears the flag on the object it returns, but `mock_initialization` is
-@torch.jit.unused so the cleared state is not serialised. A reloaded module reports
-is_initialized() == True, skips the "not initialized" guard, and returns untouched
-output buffers — all-zero logits with no NEFF loaded, which is what the earlier
-run_joint.py hit.
-
-Verification, in order of what would be most embarrassing to get wrong:
-
-  1. non-zero, finite logits — catches the all-zero failure directly, plus a
-     neuron-monitor style sanity check that the graph really executed
-  2. top-1 token vs the standalone prefill artifact's known answer
-  3. the cache hand-off: decode continues from prefill's cache, and its tokens
-     match feeding the same prompt through decode alone
-  4. TTFT and TPOT
+Two follow-ups, in order of expected value:
+  1. Compare against a working NxDI model (llama) end-to-end on this box and SDK.
+     One run settles whether this is our integration or the environment; the
+     diff in its initialize/load sequence is then the answer.
+  2. TP=2 for fast iteration is currently blocked by a compiler capacity error,
+     [NCC_INLA001] Allocated memory out of bound {concatenate}@SB(505x512), where
+     505 is close to index_topk=512 -- pointing at the sparse_attn topk
+     concatenation width. Worth understanding regardless.
 """
 
 import argparse
@@ -256,6 +248,18 @@ def main():
     print(f"[dev] compiled both graphs in {time.perf_counter() - t0:.1f}s",
           flush=True)
 
+    # Save, drop, reload -- NxDI's own sequence (application_base.compile does
+    # jit.save then `del traced_model`; load() then does a fresh jit.load). Worth
+    # trying because the object ModelBuilder returns is what jit.trace produced,
+    # and every all-zero result so far came from running that in-process object.
+    save_path = os.path.join(args.compiler_workdir, "model.pt")
+    torch.jit.save(traced, save_path)
+    del traced
+    from torch_neuronx import libtorchneuron
+    libtorchneuron.load()
+    traced = torch.jit.load(save_path)
+    print(f"[dev] saved, dropped and reloaded from {save_path}", flush=True)
+
     # Per-rank weights: NxD's own sharding cannot handle this model (it does not
     # recognise HF's same-named parallel classes), so build them here.
     print(f"[dev] building weights for {args.tp} ranks ...", flush=True)
@@ -318,7 +322,14 @@ def main():
     def call(token_ids, positions):
         inp = torch.tensor([token_ids], dtype=torch.long)
         pos = torch.tensor([positions], dtype=torch.int32)
-        out = traced(inp, pos)
+        # Call nxd_model directly, NOT the traced NxDModelExecutor wrapper.
+        # `traced` came out of torch.jit.trace, which recorded the ops of ONE
+        # example shape; replaying it does not re-run NxDModel.router, so it
+        # neither dispatches by shape nor executes the NEFF -- it returns the
+        # recorded (zero) outputs in ~0.03 s. NxDI's own warmup goes straight to
+        # `model.model.nxd_model.forward(example)` for the same reason
+        # (application_base.py:363).
+        out = traced.nxd_model.forward([inp, pos])
         while isinstance(out, (tuple, list)):
             out = out[0]
         return out
