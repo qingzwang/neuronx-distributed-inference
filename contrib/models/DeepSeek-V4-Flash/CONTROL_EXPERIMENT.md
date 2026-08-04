@@ -500,3 +500,59 @@ Candidates, and why each is plausible:
    compressed entries differ.
 3. **`hc_head` / head input.** Both paths read only the last position, but prefill
    passes a `[1, 128, hc, d]` activation and decode a `[1, 1, hc, d]` one.
+
+
+## Prefill/decode parity: the model is correct (cosine 0.9997)
+
+Built the parity check the existing gates were missing — prefill(seqlen=N) against N
+sequential decode steps — on CPU at TP=1, which is the only valid CPU configuration.
+
+First attempt showed cosine 0.041, 0/20 top-20 overlap, and appeared to confirm a
+real bug. It was a **harness gap**. Bisecting per layer, even a single ratio-0 layer
+(no compressor, no indexer, plain sliding window) diverged, and comparing the window
+cache directly showed why:
+
+```
+prefill nonzero rows: 16/128
+decode  nonzero rows:  1/128     <- only the last step's write survived
+```
+
+`DSV4Model.forward` *returns* the new state but never writes it back into
+`kv_mgr.past_key_values`. On device that is correct and deliberate: NxD's aliasing
+writes graph output `n+i` back over `past_key_values[i]` after every call. On CPU
+nothing does, so each decode step restarted from a fresh cache. Emulating the
+aliasing in the harness:
+
+```python
+outs = md(ids[:, p:p+1], pos)
+for i, t in enumerate(outs[1:]):
+    md.kv_mgr.past_key_values[i].copy_(t)
+```
+
+| | first attempt | with aliasing emulated |
+|---|---|---|
+| cosine | 0.041 | **0.999696** |
+| top-1 | different | **same (110087)** |
+| top-20 overlap | 0/20 | **18/20** |
+| rel mean error | 1.38 | **0.0247** |
+
+So **prefill and decode agree**: the joint model's arithmetic is right, and the
+prefill-to-decode hand-off the whole rewrite exists for is numerically sound at the
+model level.
+
+### What this means for the device measurement
+
+The earlier device gate (joint 5L prefill vs the 5L decode artifact, cosine 0.159)
+compared against a *reference* that ingests the prompt through 128 real decode steps
+with real aliasing — that side was fine. But it compared it to a joint prefill whose
+own correctness had not yet been established, and it is now clear the two differ in
+what state they have accumulated, not necessarily in their math. That comparison
+needs redoing now that parity is established, and the useful device check is the one
+the design doc lists: joint prefill followed by joint decode steps, against the same
+sequence run entirely through decode.
+
+Also worth adding as a permanent gate: this prefill/decode parity test did not exist,
+and its absence is exactly why a semantic difference between the two formulations
+could not have been caught by `test_prefill_functional_vs_inplace` (which compares
+the two *prefill* implementations) or `test_dsv4_model` (which compares each mode to
+its own reference).
