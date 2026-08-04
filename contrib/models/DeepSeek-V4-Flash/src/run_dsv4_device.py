@@ -231,6 +231,27 @@ def main():
     from neuronx_distributed.trace.model_builder import ModelBuilder
 
     os.makedirs(args.compiler_workdir, exist_ok=True)
+    # checkpoint_loader returns {} deliberately.
+    #
+    # Tried routing weights through builder.shard_checkpoint() instead, since
+    # NxDI's own load path does that and the control experiment showed that path
+    # works on this box. It does NOT work for this model, and the error is the
+    # proof of why shard_loader.py has to exist:
+    #
+    #   Incorrect tensor shape at inner.embed.weight: received 129280 4096,
+    #                                                 expected 4040 4096
+    #   ... attn_sink: received 64, expected 2
+    #
+    # 129280/32 = 4040 and 64/32 = 2, i.e. shard_checkpoint handed back the FULL
+    # tensors having sharded nothing -- exactly the silent no-op shard_loader's
+    # header documents, because NxD's shard_children early-returns unless a module
+    # is an instance of its own parallel classes and HF's model.py declares
+    # same-named ones of its own.
+    #
+    # The useful part: that error also shows the runtime DOES validate weight
+    # shapes on initialize(). Our hand-sharded dict passes that validation, so the
+    # weights reaching the device are correctly shaped and correctly named -- which
+    # rules weights out as the cause of the all-zero logits.
     builder = ModelBuilder(
         router=None, tp_degree=args.tp, checkpoint_loader=lambda: {},
         compiler_workdir=args.compiler_workdir, logical_nc_config=2,
@@ -260,9 +281,18 @@ def main():
     traced = torch.jit.load(save_path)
     print(f"[dev] saved, dropped and reloaded from {save_path}", flush=True)
 
-    # Per-rank weights: NxD's own sharding cannot handle this model (it does not
-    # recognise HF's same-named parallel classes), so build them here.
-    print(f"[dev] building weights for {args.tp} ranks ...", flush=True)
+    # Weights via builder.shard_checkpoint(), which is what NxDI's own load path
+    # uses (application_base.load_weights -> get_builder().shard_checkpoint()).
+    # It runs preprocess_checkpoint (which drops keys absent from
+    # model.state_dict() and renames to the graph's convention), cast_weights, and
+    # shard_weights_with_cache per rank. The previous hand-assembled dict skipped
+    # all of that; the control experiment (CONTROL_EXPERIMENT.md) showed NxDI's
+    # path works on this box, so matching it is the next thing to try.
+    #
+    # The checkpoint_loader passed to ModelBuilder returns the FULL checkpoint
+    # here rather than {} -- shard_checkpoint calls it once and slices per rank.
+    print(f"[dev] building rank-sharded weights for {args.tp} ranks ...",
+          flush=True)
     t0 = time.perf_counter()
     per_rank = _rank_weights(args.tp)
     print(f"[dev] weights ready in {time.perf_counter() - t0:.1f}s", flush=True)
