@@ -205,3 +205,40 @@ at state left behind by one pass being consumed by the next — the managed sink
 rebuilt per call, and a probe that rebuilds it between the stack and the head gets
 a different (clean) ring than a single pass does. That is the next thing to test:
 whether the head is reading ring state the stack has already rolled.
+
+
+## Correction: the CPU NaN was a simulation artifact, not a bug
+
+The previous section claimed "the graph computes NaN" and treated that as the root
+cause. **That conclusion was wrong**, and the experiment that shows it is a TP
+sweep on CPU with everything else held fixed:
+
+| | logits | ids in rank 0's vocab shard |
+|---|---|---|
+| **TP=1** | **finite**, absmax 6.05 | 128/128 |
+| TP=32 | NaN | **5/128** |
+
+Under `mock_distributed` every collective is a no-op. At TP=32 rank 0 owns 1/32 of
+the vocab and 1/32 of every column-parallel weight, so 123 of 128 embedding rows
+are legitimately zero on that rank and every `all_reduce` that should have summed
+32 partial results contributes only one. RMSNorm then normalises by a near-zero
+mean, which is where the inf/NaN comes from.
+
+On the real device the collectives are real, so this specific NaN cannot occur
+there. Running the model at TP=1 on CPU is finite, which is the correct
+single-process check and is what the five CPU gates already do.
+
+Two things follow:
+
+1. **The graph math is not the problem.** TP=1 CPU is finite; the five CPU gates
+   are bit-identical to the validated patched-HF path. Nothing points at the model.
+2. **The device zeros still need an explanation**, and "the graph computes NaN" is
+   no longer it. What remains unexplained: `is_initialized()` is True, weights and
+   state are verified on device with correct shapes, routing and flattening are
+   correct, and the call returns exact zeros in 0.03 s with zero neuron-monitor
+   runtimes.
+
+Also worth recording as a methodological note, since it cost time twice: a
+single-process CPU run of a TP>1 model under `mock_distributed` is **not** a valid
+correctness reference. It was used here to "prove" NaN and earlier to reason about
+transfer timings. Any CPU parity check for this port has to run at TP=1.
