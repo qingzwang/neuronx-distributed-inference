@@ -86,3 +86,43 @@ untested, in the order they are worth trying:
 Qwen3-1.7B: 3.8 GB download, ~6 min to compile and run at TP=8. Cheap enough that
 this should have been the *first* diagnostic rather than the seventh — it answers
 "is it me or the box" in one run, which six model-side experiments could not.
+
+
+## Follow-up: static comparison of the two artifacts
+
+Compared the working Qwen3 artifact against ours without occupying the device.
+Both are `NxDModel`s with the same structure; every dispatch component in ours
+checks out individually:
+
+| | Qwen3 (works) | ours |
+|---|---|---|
+| `models` keys | `context_encoding_model`, `token_generation_model` | `prefill`, `decode` |
+| `flattener_map` keys | `..._0` for each | `prefill_0`, `decode_0` |
+| `input_shape_map` | 7 inputs per graph | 2 inputs per graph |
+| `state_initializer` | present | present |
+| `weight_loader` | **present** | **None** |
+
+Verified directly on our artifact:
+
+* `router([ids, pos])` returns `('prefill', 0)` — routing is correct. (An earlier
+  Python-level string comparison suggested the shape keys could not match; that was
+  wrong. TorchScript renders `tensor.shape` as a plain list, so they do match.)
+* `flattener_map['prefill_0']([ids, pos])` returns the 2 expected tensors with the
+  right shapes and dtypes.
+* `models` keys equal what the router returns, so `NxDModel.forward`'s
+  match-by-name loops both fire.
+* A **freshly loaded** artifact raises "not initialized" on forward, so that guard
+  works; after our `initialize()` it does not raise, i.e. the SPMD models really do
+  report initialised.
+
+So: routing, flattening, naming, state binding, weight shape and weight naming are
+all correct, the guard confirms initialisation happened, and the NEFF still
+produces nothing. `weight_loader` is the one structural difference left, and it is
+None here only because no `priority_model_idx` is set — which also means
+`initialize()` takes the plain `_parallel_load` path rather than the layout-aware
+one.
+
+Two inputs differences also stand out and are cheap to try next:
+`input_ids` is int32 in NxDI's own input generator (ours is int64), and NxDI passes
+seven inputs including `seq_ids` and `sampling_params`. Neither should matter given
+routing succeeds, but "should not matter" has been wrong twice already here.

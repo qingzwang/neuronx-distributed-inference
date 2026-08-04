@@ -349,6 +349,17 @@ def main():
         per_rank, torch.tensor([0], dtype=torch.int32, device="cpu"))
     print(f"[dev] initialize() in {time.perf_counter() - t0:.1f}s", flush=True)
 
+    # Is the SPMD model actually initialised after our initialize()? A fresh
+    # jit.load raises "not initialized" on forward, so the guard does work -- if it
+    # reports True here and still returns zeros, the NEFF is being invoked and
+    # producing nothing, which is a different problem from never being invoked.
+    try:
+        sm = traced.nxd_model.models["prefill"]
+        print(f"[dev] prefill SPMD is_initialized: "
+              f"{[mm.is_initialized() for mm in sm.models]}")
+    except Exception as e:
+        print(f"[dev] could not query is_initialized: {type(e).__name__}: {e}")
+
     def call(token_ids, positions):
         inp = torch.tensor([token_ids], dtype=torch.long)
         pos = torch.tensor([positions], dtype=torch.int32)
