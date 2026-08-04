@@ -346,3 +346,76 @@ example-input degeneracy, compiler version, or the compile cache.
 The next thing I would do is dump the HLO text for the prefill graph and read what
 instruction feeds root tuple element 0 — that is the one remaining place the answer
 can be, and it is static.
+
+
+## ROOT CAUSE FOUND: in-place `all_gather` does not survive XLA tracing
+
+Dumping the compiled HLO and reading what feeds root tuple element 0 answered it
+immediately:
+
+```
+root elem0: add [1, 129280]
+  <- concatenate [1, 129280]        32 operands, ALL broadcast
+  <- broadcast [1, 4040]
+  <- reshape / broadcast / constant     <- a CONSTANT
+```
+
+All 32 rank slices of the logits were **broadcast constants**. The logits output was
+a compile-time constant the whole time, which is exactly why it came back as an
+untouched zero buffer while the 17 KV state outputs were written correctly.
+
+The cause is in HF's `ParallelHead.forward`:
+
+```python
+all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+dist.all_gather(all_logits, logits)          # writes IN PLACE
+logits = torch.cat(all_logits, dim=-1)
+```
+
+`dist.all_gather` fills a list the caller allocated. XLA tracing records *dataflow*,
+not writes into pre-existing buffers, so the trace keeps the `empty_like`
+placeholders and the gathered values never connect to the output. The state outputs
+were unaffected because they flow through functional `index_copy`.
+
+This never showed up on the `parallel_model_trace` path because that traces each
+rank in its own process against a real process group, where the in-place write
+actually happens during tracing and the recorded graph picks up the result.
+
+### The fix, and why the obvious one is not enough
+
+`dist.all_gather_into_tensor(out, t)` is *also* in place — it fills `out`. Tried it;
+the HLO improved to a real transpose/reshape chain but still bottomed out in a
+broadcast constant.
+
+What works is `torch_xla.core.xla_model.all_gather`, which **returns** the gathered
+tensor:
+
+```python
+logits = xm.all_gather(logits, dim=-1, groups=groups)
+```
+
+HLO after the fix — a genuine computation:
+
+```
+root elem0: add [1, 129280]
+  <- get-tuple-element / all-reduce / pad / dot / convert / reshape
+```
+
+and on device:
+
+| | before | after |
+|---|---|---|
+| TTFT | 0.03 s | **0.28 s** |
+| logits | all zero, 1 unique value | **absmax 79.56, std 4.41, 4041 unique** |
+| decode steps | — | 10-11 ms/token |
+
+So the graph now computes and returns real logits. **This was the root cause of the
+all-zero output.**
+
+### Remaining: the gather is still only local
+
+`n_zero = 125240/129280` leaves exactly `4040 = 129280/32` non-zero — one rank's
+vocab shard. So `xm.all_gather` is not combining ranks yet; passing
+`groups` derived from the TP group's `_mesh` did not change it. The generated text
+is correspondingly wrong (`'\ufffd\ufffdactionix'`), which is expected while 31/32
+of the vocab is missing. That is the next thing to fix and it is a narrow one.

@@ -128,3 +128,73 @@ def patch_hf_dist(hf_mod):
     either way.
     """
     hf_mod.dist = _GroupAwareDist()
+
+
+def patch_parallel_head_all_gather(hf_mod):
+    """Replace ParallelHead's in-place `all_gather` with a functional one.
+
+    This is the bug that made the joint graph return all-zero logits while
+    correctly writing all 17 KV state buffers. HF's head does:
+
+        all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+        dist.all_gather(all_logits, logits)
+        logits = torch.cat(all_logits, dim=-1)
+
+    `dist.all_gather` writes into `tensor_list` **in place**. XLA tracing records
+    dataflow, not side effects on pre-existing tensors, so the trace keeps the
+    `empty_like` placeholders and never connects the gathered values. Reading the
+    compiled HLO shows exactly that: root tuple element 0 is
+    `add(concatenate(32 x broadcast(constant)), ...)` — all 32 rank slices are
+    broadcast constants, so the logits output was a constant the whole time. The
+    state outputs were fine because they flow through functional `index_copy`.
+
+    `all_gather_into_tensor` is the functional form: one output tensor, returned
+    rather than mutated, so the trace captures it. The output layout is the
+    concatenation along dim 0 of each rank's contribution, so for a
+    `[batch, vocab_shard]` input the result is `[world_size * batch, vocab_shard]`
+    and has to be reshaped to `[batch, world_size * vocab_shard]` to match what
+    `cat(..., dim=-1)` produced.
+
+    Worth stating why this did not show up on the `parallel_model_trace` path: that
+    path traces each rank in its own process with a real process group, where the
+    in-place write happens for real during tracing and the recorded graph picks up
+    the resulting values.
+    """
+    import torch
+
+    def parallel_head_forward(self, x, hc_fn, hc_scale, hc_base, norm):
+        x = self.hc_head(x, hc_fn, hc_scale, hc_base)
+        logits = self.get_logits(norm(x))
+        ws = hf_mod.world_size
+        if ws > 1:
+            # xm.all_gather RETURNS the gathered tensor rather than filling one
+            # that was allocated beforehand. That distinction is the whole fix:
+            # both `dist.all_gather(list, t)` and
+            # `dist.all_gather_into_tensor(out, t)` write into memory the caller
+            # already owns, and XLA tracing records dataflow rather than writes to
+            # pre-existing buffers, so the trace keeps the placeholder and the
+            # gathered values never reach the output. Confirmed by reading the HLO
+            # both times: with the list form root element 0 was
+            # concatenate(32 x broadcast(constant)); with the into_tensor form it
+            # became a real transpose/reshape chain that still bottomed out in a
+            # broadcast constant.
+            #
+            # xm.all_gather over dim=-1 reproduces HF's `cat(all_logits, dim=-1)`
+            # directly, so no reshape gymnastics are needed either.
+            import torch_xla.core.xla_model as xm
+            # `groups` must be the TP replica mesh. Without it xm.all_gather
+            # degenerates to a local copy: the output came back with exactly
+            # 4040 = 129280/32 non-zero entries, i.e. only this rank's own vocab
+            # shard, the rest untouched.
+            #
+            # Under mock_distributed the TP group is a MagicMock carrying `_mesh`,
+            # which is where NxD's own layers read their replica groups from.
+            groups = None
+            g = tp_group()
+            mesh = getattr(g, "_mesh", None)
+            if mesh is not None:
+                groups = [list(m) for m in mesh]
+            logits = xm.all_gather(logits, dim=-1, groups=groups)
+        return logits
+
+    hf_mod.ParallelHead.forward = parallel_head_forward

@@ -116,6 +116,10 @@ def _build(mode):
 
     compile_neuron.apply_xla_patches(hf)
     collectives.patch_hf_dist(hf)
+    # ParallelHead's in-place dist.all_gather does not survive XLA tracing: the
+    # trace keeps the empty_like placeholders and the logits output compiles to a
+    # constant. See patch_parallel_head_all_gather.
+    collectives.patch_parallel_head_all_gather(hf)
     helper_state = compile_neuron.index_helper_state()
     dsv4_patches.install(hf)
 
