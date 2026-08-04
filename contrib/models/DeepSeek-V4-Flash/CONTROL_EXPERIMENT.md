@@ -461,3 +461,42 @@ The valid next comparisons, in order:
    (`dsv4_decode_tp32_L5`) on the same prompt — same depth, so the logits should
    agree to bf16 tolerance. This is the real correctness gate for the joint path.
 2. Then compile the joint graph at 43 layers and check for `' Paris'` at ~25.5.
+
+
+## Same-depth correctness gate: the joint graph does NOT match yet
+
+With the two output bugs fixed, the joint graph produces a real distribution, so it
+is finally possible to gate it on correctness. The valid reference is the **5-layer**
+decode artifact (`dsv4_decode_tp32_L5`), fed the identical 128 prompt ids one token
+at a time — same depth, same weights, same prompt, and its logits after the last
+prompt token are the same quantity the joint prefill produces.
+
+| | joint prefill (5L) | reference decode (5L) |
+|---|---|---|
+| top-1 | 96828 `'ENTIAL'` @ 19.61 | 104496 `'/is'` @ 25.73 |
+| std | 3.415 | 3.550 |
+| **cosine similarity** | **0.159** | |
+| **top-50 overlap** | **0 / 50** | |
+| rel mean error | 1.27 | |
+
+The distributions have similar scale (std 3.4 vs 3.6, so nothing is exploding or
+collapsing) but essentially no directional agreement. **There is still a real
+correctness bug in the joint path**, separate from the two output bugs fixed above.
+
+That is a useful state to be in: the failure is now numerical and measurable rather
+than an all-zero mystery, and there is a cheap same-depth reference to bisect
+against. Note the reference itself is trustworthy — this decode artifact is the one
+validated at 43 layers to 97.3% on GSM8K.
+
+Candidates, and why each is plausible:
+
+1. **Prefill vs decode window semantics.** The reference reaches position 127 by 128
+   sequential single-token steps, each writing one ring slot. The joint prefill writes
+   all 128 at once via `index_copy` over precomputed slots. `test_prefill_functional_vs_inplace`
+   gates that against the *in-place* prefill, not against decode-stepped-to-127, so a
+   disagreement between the two prefill formulations would not have been caught.
+2. **The compression ring's prefill seeding.** `n_written_prefill` decides which ring
+   slots count as real; if it disagrees with what 128 decode steps leave behind, the
+   compressed entries differ.
+3. **`hc_head` / head input.** Both paths read only the last position, but prefill
+   passes a `[1, 128, hc, d]` activation and decode a `[1, 1, hc, d]` one.

@@ -465,6 +465,13 @@ def main():
     for v, i in zip(topv.tolist(), topi.tolist()):
         print(f"    {i:>7}  {v:8.3f}  {tok.decode([i])!r}")
 
+    # Save the prefill logits so a same-depth reference can be compared offline.
+    ref_path = os.environ.get("DSV4_SAVE_LOGITS")
+    if ref_path:
+        torch.save({"ids": ids, "logits": logits[0].float().cpu(),
+                    "n_layers": args.n_layers, "tp": args.tp}, ref_path)
+        print(f"[dev] saved prefill logits -> {ref_path}", flush=True)
+
     gen, step_ms = [], []
     pos = len(ids)
     print(f"\n[dev] decode from position {pos} (prefill's cache)", flush=True)
