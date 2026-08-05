@@ -556,3 +556,48 @@ and its absence is exactly why a semantic difference between the two formulation
 could not have been caught by `test_prefill_functional_vs_inplace` (which compares
 the two *prefill* implementations) or `test_dsv4_model` (which compares each mode to
 its own reference).
+
+
+## SOLVED: joint prefill + decode works on device, sharing one KV cache
+
+The correct device comparison is prefill-then-decode against all-decode **on the same
+artifact** — same weights, same graphs, same shared cache, differing only in whether
+the prompt went through prefill or through 128 decode steps. (The earlier comparison
+against the separate `dsv4_decode_tp32_L5` artifact was not that, which is why it
+read 0.159.)
+
+| | joint prefill | all-decode, same artifact |
+|---|---|---|
+| top-1 | 96828 @ 19.610 | 96828 @ 19.610 |
+| **cosine** | **0.999994** | |
+| top-20 overlap | **20/20** | |
+| rel mean error | 0.00316 | |
+| max abs diff | 0.125 | |
+| **prompt ingest** | **0.29 s** | **1.55 s** |
+
+So the prefill graph and the decode graph agree to bf16 tolerance while sharing one
+KV cache, and prefill ingests the 128-token prompt **5.3x faster** than feeding it
+through decode. That is the capability this whole rewrite existed to get, and it is
+now demonstrated end to end at 5 layers, TP=32, with real weights.
+
+### The two bugs that had to be fixed
+
+1. **In-place `all_gather` does not survive XLA tracing.** HF's `ParallelHead` fills a
+   caller-allocated list; the trace kept the `empty_like` placeholders and compiled
+   the logits output to a constant. Fixed with NxD's functional `comm.all_gather`.
+2. **`pin_layout=True` degenerates the collective to a local copy.** Left exactly
+   1/32 of the vocab populated. NxD's own `ColumnParallelLinear` passes
+   `pin_layout=False`; matching it completed the gather.
+
+Both are properties of tracing a TP model through `ModelBuilder`, and neither can
+occur on the `parallel_model_trace` path, where each rank traces in its own process
+against a real process group. That is why the original port never hit them.
+
+### Remaining work
+
+* compile the joint graph at **43 layers** and check for `' Paris'` around 25.5, then
+  measure real TTFT/TPOT
+* re-run GSM8K through the joint path, which also now has a working cache reset
+  (re-calling `initialize()`), so the carry-over caveat on the 97.3% can be removed
+* the decode ring's first step after prefill is the highest-risk remaining seam;
+  worth a dedicated multi-step parity check rather than only the single-step one

@@ -433,6 +433,32 @@ def main():
             out = out[0]
         return out
 
+    if os.environ.get("DSV4_ALL_DECODE") == "1":
+        # Reference path on the SAME artifact: ingest the whole prompt through the
+        # decode graph, one token at a time, then continue. Same weights, same
+        # graphs, same shared cache -- the only difference is whether the prompt
+        # went through prefill or through decode. That isolates the prefill/decode
+        # hand-off from everything else, which comparing against a separate
+        # artifact could not.
+        print(f"\n[dev] all-decode: ingesting {len(ids)} tokens one at a time",
+              flush=True)
+        t0 = time.perf_counter()
+        for p_i, tid in enumerate(ids):
+            logits = call([tid], [p_i])
+        ttft = time.perf_counter() - t0
+        row = logits[0].float()
+        print(f"[dev] all-decode ingest {ttft:.2f}s  absmax={float(row.abs().max()):.3f}",
+              flush=True)
+        if ref_path := os.environ.get("DSV4_SAVE_LOGITS"):
+            torch.save({"ids": ids, "logits": row.cpu(),
+                        "n_layers": args.n_layers, "tp": args.tp,
+                        "path": "all_decode"}, ref_path)
+            print(f"[dev] saved -> {ref_path}", flush=True)
+        topv, topi = row.topk(5)
+        for v, i in zip(topv.tolist(), topi.tolist()):
+            print(f"    {i:>7}  {v:8.3f}  {tok.decode([i])!r}")
+        return
+
     print(f"\n[dev] prefill: {len(ids)} tokens, one call", flush=True)
     t0 = time.perf_counter()
     logits = call(ids, list(range(len(ids))))
