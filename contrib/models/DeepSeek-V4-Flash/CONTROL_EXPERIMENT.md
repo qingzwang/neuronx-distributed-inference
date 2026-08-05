@@ -603,33 +603,72 @@ against a real process group. That is why the original port never hit them.
   worth a dedicated multi-step parity check rather than only the single-step one
 
 
-## 43 layers: compiles, but does not fit HBM at prefill_len=128
+## 43 layers: the OOM was our own doing, and it is fixed
 
-The joint graph builds fine at full depth — both NEFFs, 2/2 `Compiler status PASS`
-in 2258 s, and all 32 ranks' weights load (4462/4462 tensors non-zero, 1337 s). It
-then dies in `initialize()`:
+The joint graph builds fine at full depth — both NEFFs, 2/2 `Compiler status PASS`,
+all 32 ranks' weights loaded. It then died in `initialize()` on a **16 MB** request.
+
+My first diagnosis was wrong. I attributed it to two NEFFs plus prefill's activation
+peak against 1.85 GB of headroom, and started shrinking `prefill_len`. That was
+reasoning from an estimate instead of reading the evidence. The runtime writes a full
+allocation dump (`/tmp/nrt_mem_log_device_*.csv`) and prints a usage table:
 
 ```
-TDRV:tensor_allocate    Failed to allocate 16777216 bytes on DEVICE
-TDRV:dmem_alloc_internal Failed to allocate DEVICE memory (16777216 bytes)
-NRT:nrt_tensor_allocate  Failed to allocate nrt tensor
+              TOTAL     Model Code   Model Constants   Tensors     Scratchpad
+ND 1 HBM 0    23.896GB   3.374MB       0.000B          23.892GB    0.000B
 ```
 
-Failing on a **16 MB** request means it is right at the ceiling, and the arithmetic
-says why. The standalone 43-layer artifact was measured at **22.15 GB of tensors per
-core** against a **24 GB** budget — 1.85 GB of headroom. The joint graph has to fit,
-in that headroom:
+`Model Code` is **1.7 MB** — both NEFFs together are negligible. `Scratchpad` is
+**0**, because the graph never executed, so activations were never the issue either.
+The whole 23.892 GB is `Tensors`.
 
-* two NEFFs' `model_code` (a 128-wide prefill graph and a 1-wide decode graph)
-  rather than one
-* prefill's activation peak, which at 128 positions x 43 layers is far larger than
-  decode's single position
-* the shared KV cache
+**Real cause.** `_rank_weights` supplied every weight under *both* naming forms —
+dotted for the runtime, arrow-separated for the HLO — on the stated assumption that
+"the two views share storage, so this costs nothing". That assumption is false.
+`_parallel_load` transfers per dict **key** and does not deduplicate by storage.
+Measured on device from the runtime's own dump: four keys pointing at one 2 GB host
+tensor produce **five** 2 GB allocations (1 from a single-key control + 4 from the
+shared-storage load), not two.
 
-So the joint path costs real HBM that the two-artifact arrangement did not, because
-there each graph had a core to itself. This is a genuine constraint of the approach,
-not a bug, and it belongs in the README as such.
+So 2231 real weights (20.610 GB/rank) were shipped as 4462 keys — about 41 GB
+requested against a 24 GB core — and it died partway, at 23.892 GB.
 
-The lever that matters is `prefill_len`, since it scales the activation peak
-directly; `seq_len` only shrinks the cache. Retrying at `--prefill-len 32
---seq-len 160`.
+The existing reconciliation had been printing the clue all along:
+
+```
+[dev] graph expects 2189 weights
+[dev] missing from my dict: 0
+[dev] extra in my dict:     2273     <- this
+```
+
+**Fix.** Ask the compiled graphs which names they bind and ship only those. One
+subtlety: `weight_name_to_idx` is keyed with arrows, but runtime binding happens in
+`spmd.initialize`, where lookup is by the traced module's **dotted** name — arrows
+alone fail with `Missing weight tensor with key inner.head.weight`. So the bound
+names are converted back to dots. Result: 2189 keys, one per tensor,
+**20.600 GB/rank**, and `initialize()` completes in 24.7 s.
+
+`prefill_len` was never the lever, and could not have been: it is pinned at >= 128 by
+the architecture, since a ratio-128 layer gets `prefill_len // 128 == 0` compressed
+entries below that, and the zero-width tensor fails XLA lowering with
+`aten::as_strided ... has no implementation`.
+
+Also correcting a related source comment: it claimed dotted-only names left the
+weights unbound and produced all-zero logits. They did not. The all-zero logits had a
+different cause — an in-place `dist.all_gather` in `ParallelHead` that XLA tracing
+dropped — fixed in `collectives.patch_parallel_head_all_gather`. Supplying both forms
+was never necessary.
+
+## Status at 43 layers, joint
+
+With the fix the joint graph runs at full depth: `initialize()` 24.7 s, TTFT 1.00 s
+for a 128-token prompt, TPOT 96 ms (median 84, n=3). The shared-cache arrangement
+**does** fit a 24 GB core.
+
+Correctness is not yet established. At `seq_len=136` the output was
+`'leirinerineesterday'` with absmax 170.056, against the standalone 43-layer prefill
+artifact's `11111 25.562 ' Paris'` on the same prompt. The prompt ids are identical
+between runs, and the 42 dropped tensors are indexer `weights_proj`/`wq_b` on ratio-4
+layers, which the graph does not bind at this length. The untested difference is
+`seq_len`: the trusted baseline used 256, this run used 136. Re-running at 256 to
+compare like with like.
