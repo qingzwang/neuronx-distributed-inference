@@ -295,14 +295,25 @@ def main():
     #
     # The checkpoint_loader passed to ModelBuilder returns the FULL checkpoint
     # here rather than {} -- shard_checkpoint calls it once and slices per rank.
+    # Ask the compiled graphs which weight names they bind, and ship only those.
+    # `_parallel_load` allocates one device copy per key with no dedup by storage,
+    # so any extra key is wasted HBM -- and at 43 layers the waste is what killed
+    # initialize(). See `_rank_weights`.
+    required = _graph_weight_names(builder)
+    print(f"[dev] graphs bind {len(required)} weight names; shipping only those",
+          flush=True)
+
     print(f"[dev] building rank-sharded weights for {args.tp} ranks ...",
           flush=True)
     t0 = time.perf_counter()
-    per_rank = _rank_weights(args.tp)
+    per_rank = _rank_weights(args.tp, required=required)
     print(f"[dev] weights ready in {time.perf_counter() - t0:.1f}s", flush=True)
     nz = sum(1 for v in per_rank[0].values()
              if v.numel() and float(v.float().abs().sum()) > 0)
     print(f"[dev] rank0: {len(per_rank[0])} tensors, {nz} non-zero")
+    _bytes = sum(v.numel() * v.element_size() for v in per_rank[0].values())
+    print(f"[dev] rank0 weight bytes: {_bytes / 2**30:.3f} GB "
+          f"(one device copy PER KEY, so this is the HBM cost)")
     if _LOAD_WEIGHTS and nz == 0:
         raise SystemExit("[FAIL] all weights zero; the load did not work")
 
@@ -521,8 +532,30 @@ def main():
               f"(median {statistics.median(step_ms):.0f}, n={len(step_ms)})")
 
 
-def _rank_weights(tp):
-    """One state dict per rank, keyed as the traced module names them."""
+def _graph_weight_names(builder):
+    """Every weight name the compiled graphs actually bind, across both keys.
+
+    Used to ship EXACTLY those and nothing else. See `_rank_weights` for why
+    shipping a superset is not free.
+    """
+    names = set()
+    for key in (PREFILL_KEY, DECODE_KEY):
+        mc = builder.model_collection[key]
+        for art in mc.hlo_artifact_collection:
+            names |= set(art.weight_name_to_idx.keys())
+    return names
+
+
+def _rank_weights(tp, required=None):
+    """One state dict per rank, keyed as the traced module names them.
+
+    `required` is the set of names the graphs bind (`_graph_weight_names`). Keys
+    outside it are dropped, because **`_parallel_load` allocates one device copy
+    per dict key** — it does not deduplicate by storage. Measured directly: four
+    keys pointing at one 2 GB host tensor produced *five* 2 GB device
+    allocations in the runtime's own dump (1 for a single-key load + 4 for the
+    shared-storage load), not two.
+    """
     import shard_loader
     from neuronx_distributed.parallel_layers import parallel_state
     from neuronx_distributed.trace.mock_torchdist import mock_distributed
@@ -542,21 +575,32 @@ def _rank_weights(tp):
             # DSV4Model holds the Transformer as `inner`, and the cache manager's
             # Parameters are aliased state, not weights -- initialize() supplies
             # only the latter.
-            # Supply BOTH naming forms. The HLO's weight_name_to_idx uses '->'
+            #
+            # Two naming forms are in play: the HLO's weight_name_to_idx uses '->'
             # separators ('inner->layers->0->attn->wkv->weight') while the runtime
-            # looks the same tensor up by its dotted name
-            # ('inner.layers.0.attn.wkv.weight'). Providing only dots leaves all
-            # 207 graph weights unbound -- the NEFF then runs against empty
-            # buffers and returns all-zero logits in 0.03 s with no error, which
-            # is exactly the failure that stalled the previous attempt.
-            # Providing only arrows raises "Missing weight tensor with key
-            # inner.layers.0.attn.wkv.weight". The two views share storage, so
-            # this costs nothing.
+            # can also look a tensor up by its dotted name
+            # ('inner.layers.0.attn.wkv.weight'). Supplying only dots leaves the
+            # graph weights unbound -- the NEFF runs against empty buffers and
+            # returns all-zero logits in 0.03 s with no error. Supplying only
+            # arrows can raise "Missing weight tensor with key inner.layers...".
+            #
+            # So both forms are generated, but only the ones a graph actually
+            # binds are kept. Shipping both unconditionally is what made the
+            # 43-layer joint run die in initialize():
+            #
+            #   the graphs bind 2189 names; the dict carried 4462
+            #   -> 2231 real weights (20.610 GB) requested as ~41 GB
+            #   -> died at 23.892 GB, having failed a 16 MB request
+            #
+            # `_parallel_load` transfers per KEY and does not dedup shared
+            # storage (measured: 4 keys over one 2 GB tensor -> 4 device copies),
+            # so every redundant key is a full extra copy in HBM.
             sd = {}
             for k, v in model.inner.state_dict().items():
                 t = v.detach()
-                sd[f"inner.{k}"] = t
-                sd["inner->" + k.replace(".", "->")] = t
+                for name in (f"inner.{k}", "inner->" + k.replace(".", "->")):
+                    if required is None or name in required:
+                        sd[name] = t
             out.append(sd)
             del model
         parallel_state.destroy_model_parallel()
