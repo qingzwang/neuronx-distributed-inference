@@ -533,17 +533,34 @@ def main():
 
 
 def _graph_weight_names(builder):
-    """Every weight name the compiled graphs actually bind, across both keys.
+    """The weight names `initialize()` binds by — dotted, one per real tensor.
 
-    Used to ship EXACTLY those and nothing else. See `_rank_weights` for why
-    shipping a superset is not free.
+    The HLO's `weight_name_to_idx` is keyed with '->' separators
+    ('inner->layers->0->attn->wkv->weight'), but that table is consumed at
+    compile time. Runtime binding happens in `spmd.initialize`, which calls
+    `_parallel_load(checkpoint)` and then hands the result to the C++ SPMDModel,
+    where lookup is by the traced module's own parameter name — dotted. Shipping
+    only the arrow forms fails there with:
+
+        RuntimeError: Missing weight tensor with key inner.head.weight
+
+    So the arrow names are converted back to dots and that is the set shipped.
+    The result is exactly one key per tensor, which matters because
+    `_parallel_load` allocates one device copy per key (see `_rank_weights`).
+
+    Worth correcting the record: an earlier comment here claimed dotted-only
+    left the graph weights unbound and produced all-zero logits. It did not.
+    The all-zero logits had a different cause — an in-place `dist.all_gather` in
+    ParallelHead that XLA tracing dropped — fixed separately in
+    collectives.patch_parallel_head_all_gather. Supplying both forms was never
+    necessary, and it is what pushed the 43-layer run out of HBM.
     """
     names = set()
     for key in (PREFILL_KEY, DECODE_KEY):
         mc = builder.model_collection[key]
         for art in mc.hlo_artifact_collection:
             names |= set(art.weight_name_to_idx.keys())
-    return names
+    return {n.replace("->", ".") for n in names}
 
 
 def _rank_weights(tp, required=None):
@@ -576,20 +593,12 @@ def _rank_weights(tp, required=None):
             # Parameters are aliased state, not weights -- initialize() supplies
             # only the latter.
             #
-            # Two naming forms are in play: the HLO's weight_name_to_idx uses '->'
-            # separators ('inner->layers->0->attn->wkv->weight') while the runtime
-            # can also look a tensor up by its dotted name
-            # ('inner.layers.0.attn.wkv.weight'). Supplying only dots leaves the
-            # graph weights unbound -- the NEFF runs against empty buffers and
-            # returns all-zero logits in 0.03 s with no error. Supplying only
-            # arrows can raise "Missing weight tensor with key inner.layers...".
+            # One key per tensor, dotted, because that is what `spmd.initialize`
+            # looks weights up by. Shipping the arrow form as well is what made
+            # the 43-layer joint run die in initialize():
             #
-            # So both forms are generated, but only the ones a graph actually
-            # binds are kept. Shipping both unconditionally is what made the
-            # 43-layer joint run die in initialize():
-            #
-            #   the graphs bind 2189 names; the dict carried 4462
-            #   -> 2231 real weights (20.610 GB) requested as ~41 GB
+            #   2231 real weights (20.610 GB/rank) shipped as 4462 keys
+            #   -> about 41 GB requested against a 24 GB core
             #   -> died at 23.892 GB, having failed a 16 MB request
             #
             # `_parallel_load` transfers per KEY and does not dedup shared
@@ -597,10 +606,9 @@ def _rank_weights(tp, required=None):
             # so every redundant key is a full extra copy in HBM.
             sd = {}
             for k, v in model.inner.state_dict().items():
-                t = v.detach()
-                for name in (f"inner.{k}", "inner->" + k.replace(".", "->")):
-                    if required is None or name in required:
-                        sd[name] = t
+                name = f"inner.{k}"
+                if required is None or name in required:
+                    sd[name] = v.detach()
             out.append(sd)
             del model
         parallel_state.destroy_model_parallel()
