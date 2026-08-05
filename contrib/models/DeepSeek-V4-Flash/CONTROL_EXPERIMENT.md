@@ -601,3 +601,35 @@ against a real process group. That is why the original port never hit them.
   (re-calling `initialize()`), so the carry-over caveat on the 97.3% can be removed
 * the decode ring's first step after prefill is the highest-risk remaining seam;
   worth a dedicated multi-step parity check rather than only the single-step one
+
+
+## 43 layers: compiles, but does not fit HBM at prefill_len=128
+
+The joint graph builds fine at full depth — both NEFFs, 2/2 `Compiler status PASS`
+in 2258 s, and all 32 ranks' weights load (4462/4462 tensors non-zero, 1337 s). It
+then dies in `initialize()`:
+
+```
+TDRV:tensor_allocate    Failed to allocate 16777216 bytes on DEVICE
+TDRV:dmem_alloc_internal Failed to allocate DEVICE memory (16777216 bytes)
+NRT:nrt_tensor_allocate  Failed to allocate nrt tensor
+```
+
+Failing on a **16 MB** request means it is right at the ceiling, and the arithmetic
+says why. The standalone 43-layer artifact was measured at **22.15 GB of tensors per
+core** against a **24 GB** budget — 1.85 GB of headroom. The joint graph has to fit,
+in that headroom:
+
+* two NEFFs' `model_code` (a 128-wide prefill graph and a 1-wide decode graph)
+  rather than one
+* prefill's activation peak, which at 128 positions x 43 layers is far larger than
+  decode's single position
+* the shared KV cache
+
+So the joint path costs real HBM that the two-artifact arrangement did not, because
+there each graph had a core to itself. This is a genuine constraint of the approach,
+not a bug, and it belongs in the README as such.
+
+The lever that matters is `prefill_len`, since it scales the activation peak
+directly; `seq_len` only shrinks the cache. Retrying at `--prefill-len 32
+--seq-len 160`.
