@@ -23,6 +23,7 @@ tests, not a new model:
 | `src/generate.py` | CLI: generate images, sweep step counts, report where the time goes |
 | `test/integration/test_model.py` | Validation tests, plus accuracy against a CPU diffusers reference |
 | `samples/` | Outputs from trn2 at the settings documented below |
+| `HANDSON.md` | 中文上手实操文档：从登录机器到出图、看延时、看监控，逐步走一遍 |
 
 What the validation is for: a wrong checkpoint otherwise fails as a shape error
 deep in weight loading. In particular **FLUX.1-schnell is rejected** — it is
@@ -31,6 +32,10 @@ weights — and a TP degree that does not divide 24 is rejected with the list of
 degrees that do.
 
 ## Usage
+
+> New to Trainium? `HANDSON.md` walks the whole thing end to end in Chinese —
+> environment check, install, download, first image, TP selection, monitoring,
+> and the errors you are likely to hit.
 
 ```bash
 pip install "diffusers==0.32.0" accelerate   # the [flux] extra
