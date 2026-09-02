@@ -290,6 +290,21 @@ class TestLoraModelManager:
                 cpu_tensor = config.cpu_weights[rank][module]
                 assert torch.equal(device_tensor[1], cpu_tensor[2])
 
+    def test_add_new_cpu_adapter_remembers_where_it_came_from(self, config):
+        """A streaming adapter has to stay reloadable after a CPU cache eviction.
+
+        insert_cpu_adapter() reloads from ckpt_paths_cpu on a CPU cache miss, and
+        list_adapters() reads the same map, so an adapter added at runtime has to
+        be recorded there.
+        """
+        new_manager = LoraModelManager(config.lora_config)
+        new_manager.lora_checkpoint.load_streaming_ckpt = Mock(return_value=config.cpu_weights)
+
+        assert new_manager.add_new_cpu_adapter("streamed", "path/to/streamed")
+
+        assert new_manager.lora_checkpoint.ckpt_paths_cpu["streamed"] == "path/to/streamed"
+        assert "streamed" in new_manager.list_adapters()
+
     def test_dynamic_update_weights_for_lora(self, config):
         new_manager = LoraModelManager(config.lora_config)
         new_manager.cpu_adapter_cache = AdapterCache(config.lora_config.max_cpu_loras, "CPU", config.cpu_adapter_ids, enable_base_model_only=config.enable_base_model_only)

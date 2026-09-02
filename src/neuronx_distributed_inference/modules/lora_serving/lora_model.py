@@ -614,6 +614,11 @@ class LoraModelManager:
     def add_new_cpu_adapter(self, adapter_name, adapter_path):
         self.add_adapter_mapping(adapter_name)
 
+        # Remember where the adapter came from. insert_cpu_adapter() reloads from
+        # ckpt_paths_cpu when a later request hits an adapter the CPU cache has
+        # since evicted, so an adapter added here has to be findable there too.
+        self.lora_checkpoint.ckpt_paths_cpu.setdefault(adapter_name, adapter_path)
+
         # Check if adapter is already loaded into CPU memory
         adapter_id = self.lora_adapter_id_mapping[adapter_name]
         streaming_weights = None
