@@ -232,5 +232,29 @@ class NeuronFluxApplication(nn.Module):
             skip_warmup,
         )
 
+    # LoRA lives entirely in the backbone -- the text encoders and the VAE are not
+    # adapted -- so these just forward to it. They are here because the pipeline is
+    # what callers hold.
+    def set_lora_adapters(self, adapter_ids):
+        """Select the adapter(s) that later ``__call__``s generate with.
+
+        Args:
+            adapter_ids: An adapter name, a list of names (one per batch item), or
+                None for the base model.
+        """
+        self.pipe.transformer.set_lora_adapters(adapter_ids)
+
+    def add_lora_adapter(self, adapter_name, adapter_path):
+        """Load an adapter that was not declared at build time. See
+        :meth:`NeuronFluxBackboneApplication.add_lora_adapter`."""
+        return self.pipe.transformer.add_lora_adapter(adapter_name, adapter_path)
+
+    def list_lora_adapters(self):
+        """Names of every adapter this model can currently serve.
+
+        Also logs which of them are on device and which are in host memory.
+        """
+        return self.pipe.transformer.lora_model_manager.list_adapters()
+
     def __call__(self, *args, **kwargs):
         return self.pipe(*args, **kwargs)

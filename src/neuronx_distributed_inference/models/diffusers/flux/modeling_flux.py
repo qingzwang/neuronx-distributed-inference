@@ -1523,10 +1523,146 @@ class NeuronFluxBackboneApplication(NeuronApplicationBase):
         self.models.append(self.model)
         self.dtype = self.config.neuron_config.torch_dtype
 
+        self.default_adapter_ids = None
+        lora_config = getattr(self.neuron_config, "lora_config", None)
+        if lora_config is not None:
+            from neuronx_distributed_inference.models.diffusers.flux.lora import (
+                FluxLoraCheckpoint,
+            )
+
+            # NeuronApplicationBase gave the manager a stock LoraCheckpoint, whose
+            # module-to-weight matching cannot resolve FLUX names (see
+            # FluxLoraCheckpoint). Runtime adapter loading reads checkpoints
+            # through this manager, so it needs the FLUX one.
+            attn_dim = self.config.num_attention_heads * self.config.attention_head_dim
+            self.lora_model_manager.lora_checkpoint = FluxLoraCheckpoint(
+                lora_config, attn_dim
+            )
+
     def get_model_wrapper_cls(self):
         return ModelWrapperFluxBackbone
 
+    def get_cte_model(self):
+        """The model instance the LoRA machinery loads and shards weights against.
+
+        The base class looks for a ``context_encoding_model``, which diffusion does
+        not have: there is no prefill/decode split, just one backbone, and it is
+        the model that owns the LoRA modules. Returning it here is what makes the
+        inherited dynamic-LoRA path in ``load_weights`` work unchanged.
+
+        Returns:
+            The CPU-side backbone built by the model builder, or None before the
+            builder has run.
+        """
+        if not (self._builder and self._builder.model_collection):
+            return None
+        container = self._builder.model_collection.get(self.model.tag)
+        if container is None:
+            return None
+        model, _ = container.model_instance.get(0)
+        return model
+
+    def set_lora_adapters(self, adapter_ids):
+        """Set the adapters used by later calls that do not name their own.
+
+        ``FluxPipeline.__call__`` has no adapter argument and does not pass extra
+        kwargs down to the transformer, so a full text-to-image run cannot name an
+        adapter per call. It selects one here instead.
+
+        Args:
+            adapter_ids: An adapter name, a list of names (one per batch item), or
+                None to go back to the base model.
+        """
+        self.default_adapter_ids = adapter_ids
+
+    def add_lora_adapter(self, adapter_name, adapter_path):
+        """Load an adapter that was not declared when the model was built.
+
+        The weights land in the host cache; they move into a device slot the first
+        time the adapter is actually requested.
+
+        Args:
+            adapter_name: Name to request the adapter by.
+            adapter_path: Directory or file holding it.
+
+        Returns:
+            True on success.
+
+        Raises:
+            RuntimeError: If the model was built without ``dynamic_multi_lora``,
+                in which case the device slots are fixed at build time and no
+                adapter can be added.
+        """
+        lora_config = getattr(self.neuron_config, "lora_config", None)
+        if lora_config is None or not lora_config.dynamic_multi_lora:
+            raise RuntimeError(
+                "Adding adapters at runtime needs a model built with "
+                "dynamic_multi_lora=True."
+            )
+        return self.lora_model_manager.add_new_cpu_adapter(adapter_name, adapter_path)
+
+    def select_lora_adapters(self, adapter_ids, batch_size):
+        """Resolve requested adapters to the device slot indices the graph takes.
+
+        Args:
+            adapter_ids: An adapter name, a list of names (one per batch item),
+                None for the base model (or for whatever
+                :meth:`set_lora_adapters` last set), or an already-resolved int32
+                tensor of device slots, which is passed through untouched.
+            batch_size: Number of batch items, i.e. how many slots are needed. A
+                single name is broadcast across the batch.
+
+        Returns:
+            An int32 tensor of device slot indices, or None if this model was built
+            without LoRA.
+
+        Under ``dynamic_multi_lora`` this also makes the requested adapters
+        resident: one that is only in the host cache is copied into a device slot,
+        evicting the least recently used occupant. That happens per call rather
+        than per request, so it also runs on every denoising step -- a step whose
+        adapter is already on device pays only a cache bookkeeping update, and a
+        step whose adapter is not gets it swapped in, which is what correctness
+        requires when several pipelines share one model.
+        """
+        lora_config = getattr(self.neuron_config, "lora_config", None)
+        if lora_config is None:
+            return None
+        if isinstance(adapter_ids, torch.Tensor):
+            # An index past the last slot is not caught by the graph: the device
+            # gathers out of bounds, logs thousands of DGE notifications and
+            # returns whatever it read. Reject it here instead.
+            if adapter_ids.numel() and int(adapter_ids.max()) >= lora_config.max_loras:
+                raise ValueError(
+                    f"adapter_ids {adapter_ids.tolist()} names a device slot at or "
+                    f"beyond max_loras={lora_config.max_loras}; valid slots are "
+                    f"0..{lora_config.max_loras - 1}."
+                )
+            return adapter_ids
+
+        if adapter_ids is None:
+            adapter_ids = self.default_adapter_ids
+        if isinstance(adapter_ids, str):
+            adapter_ids = [adapter_ids]
+        if adapter_ids is not None and len(adapter_ids) == 1 < batch_size:
+            # One adapter named for a batched call -- e.g. CFG parallel, whose two
+            # batch items are the same request.
+            adapter_ids = list(adapter_ids) * batch_size
+
+        ids = self.lora_model_manager.convert_adapter_ids_to_indices(
+            adapter_ids, batch_size
+        )
+        if not lora_config.dynamic_multi_lora:
+            return ids
+        return self.lora_model_manager.dynamic_update_weights_for_lora(
+            self.models[0].model.nxd_model.weights, ids
+        )
+
     def forward(self, *model_inputs, **kwargs):
+        if getattr(self.neuron_config, "lora_config", None) is not None:
+            hidden_states = model_inputs[0] if model_inputs else kwargs["hidden_states"]
+            kwargs["adapter_ids"] = self.select_lora_adapters(
+                kwargs.get("adapter_ids"), hidden_states.shape[0]
+            )
         return self.models[0](*model_inputs, **kwargs)
 
     @contextmanager

@@ -1,23 +1,30 @@
 # Copyright Amazon Web Services and its Affiliates. All Rights Reserved.
 # ==============================================================================
-"""Unit tests for the FLUX LoRA key mapping.
+"""Unit tests for FLUX LoRA: the key mapping and the adapter selection logic.
 
-The mapping tests run on CPU with synthetic tensors, so they need neither a
-device nor a checkpoint. The one test that checks the converted names against the
-real NxDI module tree needs a FLUX checkpoint and skips without
+These run on CPU with synthetic tensors, so they need neither a device nor a
+checkpoint. The one test that checks the converted names against the real NxDI
+module tree needs a FLUX checkpoint and skips without
 ``FLUX_LORA_TEST_CHECKPOINT``.
 """
 
 import os
+import tempfile
+from types import SimpleNamespace
 from unittest import TestCase, main, skipIf
 
 import torch
 
 from neuronx_distributed_inference.models.diffusers.flux.lora import (
     FLUX_LORA_TARGET_MODULES,
+    build_flux_lora_config,
     convert_flux_lora_to_nxdi,
     split_single_block_proj_out,
 )
+from neuronx_distributed_inference.models.diffusers.flux.modeling_flux import (
+    NeuronFluxBackboneApplication,
+)
+from neuronx_distributed_inference.modules.lora_serving.lora_model import LoraModelManager
 
 CHECKPOINT = os.environ.get("FLUX_LORA_TEST_CHECKPOINT")
 
@@ -186,6 +193,156 @@ class TestConvertFluxLoraToNxdi(TestCase):
             )
 
 
+class _StubBackbone:
+    """Enough of NeuronFluxBackboneApplication to exercise adapter selection.
+
+    The method under test is taken unbound from the real class, so it is the
+    shipping code that runs; only its surroundings -- a device, a traced graph --
+    are stubbed out. ``dynamic_update_weights_for_lora`` is replaced by a recorder
+    that offsets the ids, so a test can tell whether the dynamic path was taken.
+    """
+
+    select_lora_adapters = NeuronFluxBackboneApplication.select_lora_adapters
+    DYNAMIC_OFFSET = 100
+
+    def __init__(self, lora_config):
+        self.neuron_config = SimpleNamespace(lora_config=lora_config)
+        self.default_adapter_ids = None
+        self.dynamic_calls = []
+        self.models = [
+            SimpleNamespace(model=SimpleNamespace(nxd_model=SimpleNamespace(weights="W")))
+        ]
+        if lora_config is not None:
+            self.lora_model_manager = LoraModelManager(lora_config)
+            self.lora_model_manager.dynamic_update_weights_for_lora = self._record
+
+    def _record(self, weights, ids):
+        self.dynamic_calls.append((weights, ids.tolist()))
+        return ids + self.DYNAMIC_OFFSET
+
+
+class TestSelectLoraAdapters(TestCase):
+    """Names in, device slot indices out."""
+
+    @classmethod
+    def setUpClass(cls):
+        # LoraServingConfig insists the paths exist, but nothing here reads them.
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.paths = {}
+        for name in ("first", "second"):
+            path = os.path.join(cls._tmp.name, f"{name}.safetensors")
+            open(path, "wb").close()
+            cls.paths[name] = path
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _stub(self, dynamic=False):
+        return _StubBackbone(
+            build_flux_lora_config(
+                max_loras=2,
+                max_lora_rank=RANK,
+                lora_ckpt_paths=dict(self.paths),
+                dynamic_multi_lora=dynamic,
+            )
+        )
+
+    def test_no_lora_config_selects_nothing(self):
+        self.assertIsNone(_StubBackbone(None).select_lora_adapters(["first"], 1))
+
+    def test_names_map_to_slots_in_declaration_order(self):
+        # Slot 0 is the base model, so the first declared adapter is slot 1.
+        stub = self._stub()
+        self.assertEqual(stub.select_lora_adapters(["first"], 1).tolist(), [1])
+        self.assertEqual(stub.select_lora_adapters(["second"], 1).tolist(), [2])
+        self.assertEqual(stub.dynamic_calls, [], "static path must not swap weights")
+
+    def test_no_adapter_means_the_base_slot(self):
+        self.assertEqual(self._stub().select_lora_adapters(None, 2).tolist(), [0, 0])
+
+    def test_a_single_name_is_broadcast_across_the_batch(self):
+        stub = self._stub()
+        self.assertEqual(stub.select_lora_adapters("second", 2).tolist(), [2, 2])
+        self.assertEqual(stub.select_lora_adapters(["second"], 2).tolist(), [2, 2])
+
+    def test_set_lora_adapters_supplies_the_default(self):
+        stub = self._stub()
+        NeuronFluxBackboneApplication.set_lora_adapters(stub, "second")
+        self.assertEqual(stub.select_lora_adapters(None, 1).tolist(), [2])
+        NeuronFluxBackboneApplication.set_lora_adapters(stub, None)
+        self.assertEqual(stub.select_lora_adapters(None, 1).tolist(), [0])
+
+    def test_a_tensor_is_taken_as_slots_already_resolved(self):
+        stub = self._stub(dynamic=True)
+        ids = torch.tensor([2], dtype=torch.int32)
+        self.assertIs(stub.select_lora_adapters(ids, 1), ids)
+        self.assertEqual(stub.dynamic_calls, [], "an explicit slot must not be remapped")
+
+    def test_a_slot_past_the_last_one_is_rejected(self):
+        """Out of range must raise rather than reach the device.
+
+        The graph does not bounds-check: it gathers out of bounds, floods the log
+        with DGE notifications and returns whatever it read.
+        """
+        stub = self._stub()  # max_loras=2 + base slot = slots 0..2
+        with self.assertRaisesRegex(ValueError, "beyond max_loras"):
+            stub.select_lora_adapters(torch.tensor([3], dtype=torch.int32), 1)
+
+    def test_dynamic_mode_makes_the_adapter_resident_first(self):
+        stub = self._stub(dynamic=True)
+        slots = stub.select_lora_adapters(["second"], 1)
+        self.assertEqual(stub.dynamic_calls, [("W", [2])])
+        # The returned slot is whatever the cache assigned, not the adapter id.
+        self.assertEqual(slots.tolist(), [2 + _StubBackbone.DYNAMIC_OFFSET])
+
+    def test_dynamic_mode_also_resolves_the_base_slot(self):
+        stub = self._stub(dynamic=True)
+        stub.select_lora_adapters(None, 1)
+        self.assertEqual(stub.dynamic_calls, [("W", [0])])
+
+
+class TestBuildFluxLoraConfig(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.path = os.path.join(cls._tmp.name, "adapter.safetensors")
+        open(cls.path, "wb").close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def _config(self, **kwargs):
+        return build_flux_lora_config(
+            max_lora_rank=RANK, lora_ckpt_paths={"a": self.path}, **kwargs
+        )
+
+    def test_uses_the_flux_module_set_without_reading_adapter_config_json(self):
+        # A bare .safetensors with no adapter_config.json next to it: the base
+        # class would raise here.
+        config = self._config()
+        self.assertEqual(config.target_modules, list(FLUX_LORA_TARGET_MODULES))
+        self.assertEqual(config.max_lora_rank, RANK)
+
+    def test_keeps_lora_a_unsharded(self):
+        # lora_B has to follow the base layer's gather_output, which the FLUX LoRA
+        # modules handle themselves; sharding lora_A as well breaks that.
+        self.assertFalse(self._config().lora_shard_linear_layer)
+
+    def test_reserves_a_base_slot_on_top_of_the_requested_ones(self):
+        config = self._config(max_loras=2, max_cpu_loras=3)
+        self.assertEqual(config.max_loras, 3)
+        self.assertEqual(config.max_cpu_loras, 4)
+
+    def test_dynamic_mode_puts_declared_adapters_in_the_host_tier_too(self):
+        # An adapter declared at build time must stay reloadable, otherwise it
+        # cannot be swapped back in after the device cache evicts it.
+        self.assertEqual(self._config(dynamic_multi_lora=True).lora_ckpt_paths_cpu,
+                         {"a": self.path})
+        self.assertEqual(self._config().lora_ckpt_paths_cpu, {})
+
+
 @skipIf(CHECKPOINT is None, "set FLUX_LORA_TEST_CHECKPOINT to a FLUX checkpoint")
 class TestMappingAgainstRealModuleTree(TestCase):
     """Do the converted names name modules that actually exist in NxDI?
@@ -244,6 +401,53 @@ class TestMappingAgainstRealModuleTree(TestCase):
             {k.rsplit(".lora_", 1)[0] for k in out} - linears
         )
         self.assertEqual(missing, [], f"{len(missing)} converted names do not exist")
+
+    def test_lora_layers_report_the_dtype_their_weights_will_have(self):
+        """The reported dtype has to survive the backbone's own cast.
+
+        FLUX builds its linears in float32 and casts the backbone to torch_dtype
+        afterwards, so a LoRA layer that copied its dtype from the base layer
+        reports float32 while its parameters end up bfloat16. A dynamic swap
+        allocates the host buffer from the reported dtype and copies it into the
+        device tensor, so the two have to agree.
+        """
+        from neuronx_distributed.parallel_layers.parallel_state import initialize_model_parallel
+        from neuronx_distributed.trace.mock_torchdist import mock_distributed
+
+        from neuronx_distributed_inference.models.diffusers.flux.application import (
+            create_flux_config,
+        )
+        from neuronx_distributed_inference.models.diffusers.flux.modeling_flux import (
+            NeuronFluxTransformer2DModel,
+        )
+        from neuronx_distributed_inference.modules.lora_serving.lora_layer import BaseMultiLora
+
+        tp = 4
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = os.path.join(tmp, "adapter.safetensors")
+            open(adapter, "wb").close()
+            lora_config = build_flux_lora_config(
+                max_lora_rank=RANK, lora_ckpt_paths={"a": adapter}
+            )
+            with mock_distributed(world_size=tp):
+                torch.distributed.init_process_group(backend="xla", rank=0, world_size=tp)
+                initialize_model_parallel(
+                    tensor_model_parallel_size=tp, skip_collective_init=True
+                )
+                _, _, backbone_config, _ = create_flux_config(
+                    CHECKPOINT, tp, tp, torch.bfloat16, 1024, 1024, lora_config=lora_config
+                )
+                with torch.device("meta"):
+                    model = NeuronFluxTransformer2DModel(backbone_config)
+
+        layers = [m for m in model.modules() if isinstance(m, BaseMultiLora)]
+        self.assertTrue(layers, "the backbone was not wrapped with LoRA at all")
+        wrong = {str(m.get_weight_dtype()) for m in layers} - {"torch.bfloat16"}
+        self.assertEqual(wrong, set())
+
+        model = model.to(dtype=torch.bfloat16)
+        for m in layers:
+            self.assertEqual(m.weight.dtype, m.get_weight_dtype())
 
 
 if __name__ == "__main__":

@@ -31,8 +31,10 @@ from neuronx_distributed.parallel_layers import ColumnParallelLinear, RowParalle
 
 from neuronx_distributed_inference.modules.lora_serving.config import LoraServingConfig
 from neuronx_distributed_inference.modules.lora_serving.lora_checkpoint import LoraCheckpoint
+from neuronx_distributed_inference.modules.lora_serving.lora_layer import BaseMultiLora
 from neuronx_distributed_inference.modules.lora_serving.lora_model import LoraModel, LoraWeightManager
 from neuronx_distributed_inference.modules.lora_serving.lora_module import (
+    MultiLoraModule,
     MultiLoraModuleColumnParallelLinear,
     MultiLoraModuleRowParallelLinear,
 )
@@ -467,6 +469,28 @@ class _FluxLoraModel(LoraModel):
         return super()._create_new_module(parent, target, current_key)
 
 
+def _align_lora_dtype(model, torch_dtype):
+    """Make the LoRA layers report the dtype their weights will actually have.
+
+    A LoRA layer records its dtype from the base layer it wraps. FLUX builds its
+    linears in float32 and casts the whole backbone afterwards
+    (``ModelWrapperFluxBackbone.get_model_instance``), so the recorded dtype is
+    float32 while the parameters end up ``torch_dtype``. Nothing notices until a
+    dynamic swap, which allocates the host-side buffer from the recorded dtype and
+    then copies it into a device tensor of the real one:
+
+        RuntimeError: Expected self.dtype() == dst.dtype() to be true
+
+    Overwriting it here keeps the two allocations in agreement. The attribute is
+    only read when allocating weights, never in the forward pass.
+    """
+    for module in model.modules():
+        if isinstance(module, BaseMultiLora):
+            module.dtype = torch_dtype
+        if isinstance(module, MultiLoraModule):
+            module.lora_dtype = torch_dtype
+
+
 def wrap_flux_backbone_with_lora(model, lora_config):
     """Inject LoRA adapters into a FLUX backbone.
 
@@ -496,6 +520,7 @@ def wrap_flux_backbone_with_lora(model, lora_config):
             "lora_B differs per rank and cannot be moved outside the reduce."
         )
     _FluxLoraModel(model, lora_config)
+    _align_lora_dtype(model, model.config.neuron_config.torch_dtype)
     # neuronx_distributed's preprocess_checkpoint tests for this attribute and, if
     # present, calls model.update_weights_for_lora(checkpoint) during sharding.
     model.lora_wrapped_model = True
