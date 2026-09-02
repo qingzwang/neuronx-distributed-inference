@@ -11,6 +11,16 @@ kohya, XLabs). All three work: the file is handed to
 `FluxPipeline.lora_state_dict`, so diffusers' own converters do the format work,
 and the result is mapped onto NxDI's module names from there.
 
+A runnable version of everything below is `examples/generate_flux_lora.py`:
+
+```bash
+python examples/generate_flux_lora.py \
+    -c /shared/flux/FLUX.1-dev/ --compile_workdir /tmp/flux-lora/ \
+    --lora realism=/adapters/xlabs-realism \
+    --dynamic-lora superreal=/adapters/super-realism.safetensors \
+    --max-lora-rank 64 --save_image
+```
+
 ## Declaring adapters at build time
 
 ```python
