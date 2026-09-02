@@ -300,6 +300,55 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
             reduce_dtype=self.config.neuron_config.torch_dtype,
         )
 
+        # Injected here rather than by NeuronBaseModel.__init__, which this class
+        # does not inherit from. Must come last: wrapping replaces submodules, so
+        # every target has to exist first.
+        self.lora_weight_manager = None
+        lora_config = getattr(self.config.neuron_config, "lora_config", None)
+        if lora_config is not None:
+            from neuronx_distributed_inference.models.diffusers.flux.lora import (
+                wrap_flux_backbone_with_lora,
+            )
+
+            self.lora_weight_manager = wrap_flux_backbone_with_lora(self, lora_config)
+
+    def update_weights_for_lora(self, model_sd):
+        """Rewrite the base checkpoint for the LoRA-wrapped module tree.
+
+        Called by neuronx_distributed's ``preprocess_checkpoint`` during sharding,
+        which dispatches on the ``lora_wrapped_model`` attribute. Wrapping renamed
+        every target module's weights under ``.base_layer``, and the adapter
+        weights themselves still have to be added, both of which happen here.
+        """
+        return self.lora_weight_manager.lora_checkpoint.update_weights_for_lora(
+            self, model_sd
+        )
+
+    def _select_lora_adapters(self, adapter_ids):
+        """Point every LoRA module at the slot ``adapter_ids`` names.
+
+        The wrapped layers read their weights from ``updated_weight``, which this
+        fills in. It happens once per forward rather than per layer, and once per
+        request rather than per denoising step, because the adapter is fixed for
+        the whole image -- there is no prefill/decode split to hang it off, which
+        is how the LLM path decides when to do this.
+        """
+        if self.lora_weight_manager is None:
+            return
+        if adapter_ids is None:
+            raise ValueError(
+                "adapter_ids is required when a lora_config is set: the slot is "
+                "chosen by torch.index_select over the adapter dimension, so there "
+                "is no meaningful default inside the graph. ModelWrapperFluxBackbone "
+                "supplies zeros (the base-model slot) when a caller passes none."
+            )
+        self.lora_weight_manager.update_lora_tensors(
+            adapter_ids,
+            seq_ids=None,
+            is_context_encoding=True,
+            is_continuous_batching=False,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -308,6 +357,11 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
         timestep: torch.LongTensor = None,
         guidance: torch.Tensor = None,
         image_rotary_emb: torch.Tensor = None,
+        # Positioned here, not at the end: ModelWrapperFluxBackbone passes the
+        # graph inputs positionally in input_generator's order, and adapter_ids is
+        # the tensor appended after image_rotary_emb. Everything below is
+        # keyword-only in practice.
+        adapter_ids: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_block_samples=None,
         controlnet_single_block_samples=None,
@@ -414,6 +468,9 @@ class NeuronFluxTransformer2DModel(torch.nn.Module):
             if guidance is not None and guidance.numel() > 0:
                 assert guidance.shape[0] == 1, \
                     f"After CFG scatter, batch_size should be 1, got guidance.shape[0]={guidance.shape[0]}"
+
+        # Before any wrapped layer runs, so they all see the same slot.
+        self._select_lora_adapters(adapter_ids)
 
         hidden_states = self.x_embedder(hidden_states)
 
@@ -1347,6 +1404,12 @@ class ModelWrapperFluxBackbone(ModelWrapper):
             torch.randn([num_patches + 512, attention_head_dim, 2], dtype=self.config.neuron_config.torch_dtype),
         )
 
+        # One more input when LoRA is enabled: which adapter slot each batch item
+        # uses. Left out entirely otherwise, so a model without LoRA keeps the
+        # graph -- and the compilation cache entry -- it had before.
+        if getattr(self.config.neuron_config, "lora_config", None) is not None:
+            model_inputs = model_inputs + (torch.zeros([batch_size], dtype=torch.int32),)
+
         inputs = [
             model_inputs,
         ]
@@ -1375,6 +1438,7 @@ class ModelWrapperFluxBackbone(ModelWrapper):
         guidance=None,
         joint_attention_kwargs=None,
         return_dict=False,
+        adapter_ids=None,
     ):
         """
         Override ModelWrapper.forward().
@@ -1417,15 +1481,24 @@ class ModelWrapperFluxBackbone(ModelWrapper):
         if self.cache_image_rotary_emb:
             self.image_rotary_emb = image_rotary_emb
 
-        output = self._forward(
+        model_inputs = [
             hidden_states,
             encoder_hidden_states,
             pooled_projections,
             timestep,
             guidance,
             image_rotary_emb,
-        )
-        return output
+        ]
+        if getattr(self.config.neuron_config, "lora_config", None) is not None:
+            if adapter_ids is None:
+                # Slot 0 is the base model when enable_base_model_only is set, so
+                # this is "no adapter" rather than an arbitrary one.
+                adapter_ids = torch.zeros(
+                    hidden_states.shape[0], dtype=torch.int32
+                )
+            model_inputs.append(adapter_ids.to(torch.int32))
+
+        return self._forward(*model_inputs)
 
 
 class NeuronFluxBackboneApplication(NeuronApplicationBase):

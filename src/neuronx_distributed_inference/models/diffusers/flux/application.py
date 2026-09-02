@@ -66,7 +66,8 @@ def get_flux_parallelism_config(
 
 
 def create_flux_config(model_path, world_size, backbone_tp_degree, dtype, height, width, inpaint=False,
-                       cfg_parallel_enabled=False, context_parallel_enabled=False):
+                       cfg_parallel_enabled=False, context_parallel_enabled=False,
+                       lora_config=None):
     text_encoder_path = os.path.join(model_path, "text_encoder")
     text_encoder_2_path = os.path.join(model_path, "text_encoder_2")
     backbone_path = os.path.join(model_path, "transformer")
@@ -96,6 +97,10 @@ def create_flux_config(model_path, world_size, backbone_tp_degree, dtype, height
         tp_degree=backbone_tp_degree,
         world_size=world_size,
         torch_dtype=dtype,
+        # Only the backbone takes LoRA. FLUX adapters that also carry text-encoder
+        # weights are not supported; those are separately compiled models and would
+        # each need their own adapter pool.
+        lora_config=lora_config,
     )
     backbone_config = FluxBackboneInferenceConfig(
         cfg_parallel_enabled=cfg_parallel_enabled,
