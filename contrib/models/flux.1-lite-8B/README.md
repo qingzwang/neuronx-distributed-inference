@@ -76,7 +76,7 @@ compiled shapes, so changing them means recompiling.
 | Neuron SDK | `torch-neuronx` 2.9.0.2.15, `neuronx-distributed` 0.19.28492, **`neuronx-cc` 2.26.6360.0** |
 | Frameworks | torch 2.9.1, transformers 4.57.6, diffusers 0.32.0 |
 | Precision | BF16 |
-| Parallelism | Backbone TP=4 (trn2 default) and TP=2, both measured below; TP=8 on trn1 untested. Context- and CFG-parallel are inherited from the core FLUX path but untested here. |
+| Parallelism | Backbone TP=4 (trn2 default) and TP=2, both measured below. TP=1 does not fit in one core's HBM. TP=8 on trn1 untested. Context- and CFG-parallel are inherited from the core FLUX path but untested here. |
 
 > `neuronx-cc` must be pinned. `libneuronxla 2.2` requires only `neuronx-cc~=2.0`,
 > so pip resolves to 2.27, which fails to compile with
@@ -106,6 +106,68 @@ requests after a discarded warmup request; per-stage figures come from
 Step latency is flat across step counts — the same graph runs every step on
 static shapes. Denoising is 94% of a 28-step request, which is why the backbone
 is the only component that is tensor-parallel.
+
+### TP=1/2/4 at 4 steps
+
+Default settings: `guidance_scale=3.5`, `true_cfg_scale=1.0` (classifier-free
+guidance off), 1024x1024, seed 42.
+
+| TP | ms/step | Prompt encode | Denoise | VAE decode | **End to end** |
+|---|---|---|---|---|---|
+| 4 | 217 | 38 ms | 0.88 s | 0.30 s | **1.25 s** |
+| 2 | 406 | 57 ms | 1.64 s | 0.30 s | **2.02 s** |
+| 1 | — | — | — | — | **does not fit, see below** |
+
+### The two knobs called "CFG"
+
+They are not the same thing, and only one of them costs anything:
+
+* `true_cfg_scale` (default 1.0 = **off**) is real classifier-free guidance. At 1.0
+  there is one backbone pass per step, which is what every number in this README
+  measures. Above 1.0 it needs a negative pass as well.
+* `guidance_scale` (default 3.5) is the **distilled guidance embedding** — just an
+  input to the backbone, so changing it changes the image and not the cost.
+  Measured: 4 steps at `guidance_scale=1.0` runs in the same 217 ms/step at TP=4
+  and 405 ms/step at TP=2 as at 3.5.
+
+Do not lower `guidance_scale` to 1.0 to "turn guidance off" — that is
+`true_cfg_scale`'s job, and it is already off. FLUX.1-lite is guidance-*distilled*
+around 3.5, so 1.0 falls outside what it was distilled for and produces mush
+rather than a lower-guidance image (PSNR 16.0 dB against the same seed at 3.5,
+mean 32.4/255):
+
+![guidance 1.0 vs 3.5, both 4 steps](samples/guidance_1_vs_3p5_4steps.png)
+
+To reduce prompt adherence, stay inside the distilled range, roughly 2.0-4.0. TP
+does not change the result at either value (PSNR 53.4 dB between TP=2 and TP=4 at
+guidance 1.0, mean 0.28/255):
+
+![TP=2 vs TP=4 at guidance 1.0](samples/tp2_vs_tp4_guidance1_4steps.png)
+
+### TP=1 does not fit on trn2
+
+Not a compute limit, a memory one. At TP=1 all four components share one core's
+~22 GiB of usable HBM, and the weights alone are over that:
+
+| Component | BF16 weights |
+|---|---|
+| `transformer` | 15.20 GiB |
+| `text_encoder_2` (T5-XXL) | 8.87 GiB |
+| `text_encoder` (CLIP) | 0.22 GiB |
+| `vae` | 0.15 GiB |
+| **total** | **24.44 GiB** |
+
+It compiles, and all four modules load, then dies in warmup when the runtime asks
+for activation space on top:
+
+```
+NRT:nrt_infodump  Failure: NRT_RESOURCE in nrt_tensor_allocate
+RuntimeError: nrt_tensor_allocate status=4
+```
+
+TP=2 is the minimum for this checkpoint on trn2, which halves the transformer to
+7.6 GiB per rank and T5 to 4.4 GiB. LNC=1 does not help: a logical core there
+shares its ~22 GiB partition with its pair sibling.
 
 ### TP=2 vs TP=4
 
@@ -222,7 +284,11 @@ single step and only the loose end-to-end check runs a whole schedule.
 ## Not covered
 
 - Batch sizes above 1.
-- trn1's TP=8 default (only TP=2 and TP=4 were measured, both on trn2).
+- trn1's TP=8 default (only TP=2 and TP=4 were measured, both on trn2; TP=1 was
+  measured and does not fit).
+- `true_cfg_scale > 1` (real classifier-free guidance). The core FLUX pipeline
+  supports it, including a CFG-parallel mode that batches the two passes, but it
+  costs a second backbone pass per step and was not measured here.
 - Context parallelism and CFG parallelism: available from the core FLUX path
   (`build_application(context_parallel_enabled=...)`) but not tested here.
 - img2img, inpainting, ControlNet, IP-Adapter, LoRA. The core FLUX path has
