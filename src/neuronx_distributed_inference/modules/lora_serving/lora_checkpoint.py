@@ -15,6 +15,27 @@ from .lora_layer import MultiLoraColumnParallelLinear
 
 logger = logging.getLogger("Neuron")
 
+# Weight filenames PEFT writes, most preferred first. Checked before falling back
+# to scanning the folder, so a directory holding several checkpoint-like files
+# resolves the same way every time.
+ADAPTER_WEIGHT_FILENAMES = ("adapter_model.safetensors", "adapter_model.bin")
+
+# Pickles a HuggingFace Trainer leaves beside the adapter it just saved. None of
+# them are weights, and torch.load rejects them outright under torch>=2.6's
+# weights_only=True default, so an adapter published straight from a Trainer
+# output directory used to fail to load at all.
+NON_WEIGHT_FILENAMES = frozenset(
+    {
+        "training_args.bin",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+        "pytorch_model_fsdp.bin",
+    }
+)
+
+WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".pt")
+
 
 class LoraCheckpoint:
     def __init__(self, config: LoraServingConfig):
@@ -104,38 +125,74 @@ class LoraCheckpoint:
             lora_scaling, state_dict = self._load_lora_state_dict_from_file(path)
         return lora_scaling, state_dict
 
-    def _load_lora_state_dict_from_file(self, filename):
+    def _load_weight_file(self, filename):
+        """Load one checkpoint file, dispatching on its extension."""
         if filename.endswith(".safetensors"):
-            state_dict = load_file(filename)
-        elif filename.endswith(".bin") or filename.endswith(".pt"):
-            state_dict = _torch_load(filename)
-        else:
-            raise FileNotFoundError(f"Invalid checkpoint filename {filename} for LoRA adapter.")
+            return load_file(filename)
+        elif filename.endswith((".bin", ".pt")):
+            return _torch_load(filename)
+        raise FileNotFoundError(f"Invalid checkpoint filename {filename} for LoRA adapter.")
+
+    def _load_lora_state_dict_from_file(self, filename):
+        state_dict = self._load_weight_file(filename)
 
         lora_adapter_config = state_dict.get("lora_config")
         lora_scaling = self._extract_lora_scaling(lora_adapter_config)
         state_dict.pop("lora_config", None)
         return lora_scaling, state_dict
 
-    def _load_lora_state_dict_from_folder(self, path):
-        lora_scaling, state_dict = None, None
-        for filename in os.listdir(path):
-            file_path = os.path.join(path, filename)
-            if filename.strip() == "adapter_config.json":
-                with open(file_path) as f:
-                    lora_adapter_config = json.load(f)
-                    lora_scaling = self._extract_lora_scaling(lora_adapter_config)
-            elif filename.endswith(".safetensors"):
-                state_dict = load_file(file_path)
-            elif filename.endswith(".bin") or filename.endswith(".pt"):
-                state_dict = _torch_load(file_path)
+    def _find_adapter_weight_file(self, path):
+        """Pick the weight file in an adapter folder.
 
-        if state_dict is None:
+        PEFT's own names win, safetensors ahead of the pickle. Otherwise any
+        remaining checkpoint-like file is accepted so that adapters saved under a
+        custom name keep working, but Trainer artifacts are skipped and the order
+        is deterministic -- previously this walked os.listdir and let the last
+        match win, so a folder containing both a safetensors adapter and any .bin
+        resolved differently depending on directory order.
+
+        Args:
+            path: Adapter directory.
+
+        Returns:
+            Full path to the weight file, or None if the folder holds none.
+        """
+        for filename in ADAPTER_WEIGHT_FILENAMES:
+            candidate = os.path.join(path, filename)
+            if os.path.exists(candidate):
+                return candidate
+
+        candidates = [
+            filename
+            for filename in os.listdir(path)
+            if filename.endswith(WEIGHT_FILE_SUFFIXES)
+            and filename not in NON_WEIGHT_FILENAMES
+        ]
+        if not candidates:
+            return None
+        # Sorted for determinism, safetensors first.
+        candidates.sort(key=lambda filename: (not filename.endswith(".safetensors"), filename))
+        if len(candidates) > 1:
+            logger.warning(
+                f"Found multiple candidate LoRA checkpoints in {path}: {candidates}. "
+                f"Using {candidates[0]}."
+            )
+        return os.path.join(path, candidates[0])
+
+    def _load_lora_state_dict_from_folder(self, path):
+        lora_scaling = None
+        config_path = os.path.join(path, "adapter_config.json")
+        if os.path.exists(config_path):
+            with open(config_path) as f:
+                lora_scaling = self._extract_lora_scaling(json.load(f))
+
+        weight_file = self._find_adapter_weight_file(path)
+        if weight_file is None:
             raise ValueError(
                 f"No valid LoRA adapter checkpoint in {path}."
                 f"Supported checkpoint formats include '*.safetensors', '*.bin', and '.pt'."
             )
-        return lora_scaling, state_dict
+        return lora_scaling, self._load_weight_file(weight_file)
 
     def _get_module_checkpoint(self, name, lora_ckpt):
         r"""
