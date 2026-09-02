@@ -22,6 +22,7 @@ tests, not a new model:
 | `src/flux_lite.py` | Checkpoint and TP-degree validation, config/application builder, per-stage latency measurement |
 | `src/generate.py` | CLI: generate images, sweep step counts, report where the time goes |
 | `test/integration/test_model.py` | Validation tests, plus accuracy against a CPU diffusers reference |
+| `samples/` | Outputs from trn2 at the settings documented below |
 
 What the validation is for: a wrong checkpoint otherwise fails as a shape error
 deep in weight loading. In particular **FLUX.1-schnell is rejected** — it is
@@ -39,6 +40,11 @@ python contrib/models/flux.1-lite-8B/src/generate.py \
     --prompt "A close-up photo of a red panda wearing tiny round glasses, reading a leather-bound book" \
     --steps 28 --save-image
 ```
+
+![FLUX.1-lite-8B on trn2: a red panda in round glasses reading a book](samples/flux_lite_1024px_28steps_tp4.png)
+
+*1024x1024, 28 steps, guidance 3.5, seed 42, TP=4 — exactly the command above.
+Downscaled for this page; `samples/` has the rest.*
 
 ```python
 import sys
@@ -70,7 +76,7 @@ compiled shapes, so changing them means recompiling.
 | Neuron SDK | `torch-neuronx` 2.9.0.2.15, `neuronx-distributed` 0.19.28492, **`neuronx-cc` 2.26.6360.0** |
 | Frameworks | torch 2.9.1, transformers 4.57.6, diffusers 0.32.0 |
 | Precision | BF16 |
-| Parallelism | Backbone TP=4 (trn2 default), TP=8 on trn1. Context- and CFG-parallel are inherited from the core FLUX path but untested here. |
+| Parallelism | Backbone TP=4 (trn2 default) and TP=2, both measured below; TP=8 on trn1 untested. Context- and CFG-parallel are inherited from the core FLUX path but untested here. |
 
 > `neuronx-cc` must be pinned. `libneuronxla 2.2` requires only `neuronx-cc~=2.0`,
 > so pip resolves to 2.27, which fails to compile with
@@ -87,23 +93,68 @@ trn2, BF16, batch 1, backbone TP=4, 512-token prompt budget. Median over 2
 requests after a discarded warmup request; per-stage figures come from
 `measure_stages`, which times the four Neuron submodels the pipeline calls.
 
-| Resolution | Steps | ms/step | Prompt encode | Denoise | VAE decode | **End to end** |
-|---|---|---|---|---|---|---|
-| 1024x1024 | 4 | 217 | 38 ms | 0.88 s | 0.30 s | **1.25 s** |
-| 1024x1024 | 8 | 217 | 35 ms | 1.75 s | 0.29 s | **2.13 s** |
-| 1024x1024 | 28 | 217 | 35 ms | 6.10 s | 0.29 s | **6.52 s** |
-| 512x512 | 4 | 73 | 40 ms | 0.31 s | 0.07 s | **0.44 s** |
+| TP | Resolution | Steps | ms/step | Prompt encode | Denoise | VAE decode | **End to end** |
+|---|---|---|---|---|---|---|---|
+| 4 | 1024x1024 | 4 | 217 | 38 ms | 0.88 s | 0.30 s | **1.25 s** |
+| 4 | 1024x1024 | 8 | 217 | 35 ms | 1.75 s | 0.29 s | **2.13 s** |
+| 4 | 1024x1024 | 28 | 217 | 35 ms | 6.10 s | 0.29 s | **6.52 s** |
+| 4 | 512x512 | 4 | 73 | 40 ms | 0.31 s | 0.07 s | **0.44 s** |
+| 2 | 1024x1024 | 4 | 406 | 57 ms | 1.64 s | 0.30 s | **2.02 s** |
+| 2 | 1024x1024 | 8 | 406 | 54 ms | 3.26 s | 0.29 s | **3.65 s** |
+| 2 | 1024x1024 | 28 | 406 | 54 ms | 11.37 s | 0.29 s | **11.82 s** |
 
 Step latency is flat across step counts — the same graph runs every step on
 static shapes. Denoising is 94% of a 28-step request, which is why the backbone
 is the only component that is tensor-parallel.
+
+### TP=2 vs TP=4
+
+Doubling the backbone's tensor-parallel degree is worth **1.87x** on the step
+(406 -> 217 ms), not 2x; the shortfall is the collectives. VAE decode does not
+move at all (0.29 s either way) because it runs at tp_degree=1 regardless.
+
+![Same prompt and seed at TP=2 and TP=4](samples/tp2_vs_tp4_28steps.png)
+
+Quality is unaffected: same prompt, seed and schedule at the two degrees give
+PSNR 35.2 dB, mean 0.99/255. The images are not bit-identical because summing
+partial products over 2 ranks and over 4 ranks rounds differently in BF16 — the
+same reason two GPU batch sizes can differ.
+
+TP=2 leaves two cores of the chip idle, so it is useful for running something
+else alongside, not for speed.
+
+FLUX.1-lite degrades gracefully as steps come down — 8 steps still resolves the
+subject, materials and lighting, and 4 is a usable preview:
+
+![FLUX.1-lite-8B at 4, 8 and 28 steps](samples/steps_4_8_28_tp4.png)
 
 Reproduce with:
 
 ```bash
 python contrib/models/flux.1-lite-8B/src/generate.py \
     -c /path/to/flux.1-lite-8B -n 4,8,28 --iterations 2 --json latency.json
+
+# TP=2 needs the visible core set narrowed to match; see below.
+NEURON_RT_VISIBLE_CORES=0-1 python contrib/models/flux.1-lite-8B/src/generate.py \
+    -c /path/to/flux.1-lite-8B --tp-degree 2 -n 28 --iterations 2
 ```
+
+### TP below the core count needs NEURON_RT_VISIBLE_CORES
+
+Loading pre-compiled TP=2 artifacts on a process that can see all four cores
+fails partway into the first request:
+
+```
+NRT has already been setup with a collectives world size of 2 ... but trying to
+set up collectives world size of 4
+Failed to create global communicator, g_device_id=0, g_device_count=4
+```
+
+The artifacts are correct (their `neuron_config.json` records
+`tp_degree=2, world_size=2`); the mismatch is that the distributed world is sized
+from the visible cores, which is 4. Narrow it to the TP degree —
+`NEURON_RT_VISIBLE_CORES=0-1` — and it runs. Compiling and running in one process
+does not hit this, which is why it only shows up on a second, load-only run.
 
 ## Accuracy
 
@@ -171,6 +222,7 @@ single step and only the loose end-to-end check runs a whole schedule.
 ## Not covered
 
 - Batch sizes above 1.
+- trn1's TP=8 default (only TP=2 and TP=4 were measured, both on trn2).
 - Context parallelism and CFG parallelism: available from the core FLUX path
   (`build_application(context_parallel_enabled=...)`) but not tested here.
 - img2img, inpainting, ControlNet, IP-Adapter, LoRA. The core FLUX path has
