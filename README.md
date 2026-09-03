@@ -5,6 +5,17 @@ This package provides a model hub for running inference on Neuronx Distributed (
 ## Examples
 This package includes examples that you can reference when you implement code that uses NxD Inference.
 * `generation_demo.py` - A basic generation example for Llama.
+* `generate_flux.py` - Text-to-image generation with FLUX.
+* `generate_flux_lora.py` - FLUX with multiple LoRA adapters, including adapters loaded after the model is compiled and running. See [flux_lora.md](examples/flux_lora.md) for what it supports and what it costs, and [flux_lora_handson_zh.md](examples/flux_lora_handson_zh.md) for a step-by-step walkthrough in Chinese.
+
+One compiled FLUX model, one prompt, one seed, under the base model and two
+adapters — the second of which was loaded at runtime:
+
+| base model | XLabs realism | kohya super-realism |
+|---|---|---|
+| ![](examples/flux_lora_samples/fisherman_base.png) | ![](examples/flux_lora_samples/fisherman_xlabs.png) | ![](examples/flux_lora_samples/fisherman_kohya.png) |
+
+[More samples and measurements](examples/flux_lora.md#samples).
 
 ## Run inference with the inference demo
 This package includes an inference demo console script that you can use to run inference. This script includes benchmarking and accuracy checking features that are useful for developers to verify that their models and modules work correctly.

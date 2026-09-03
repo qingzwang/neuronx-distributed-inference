@@ -11,6 +11,9 @@ kohya, XLabs). All three work: the file is handed to
 `FluxPipeline.lora_state_dict`, so diffusers' own converters do the format work,
 and the result is mapped onto NxDI's module names from there.
 
+Never used Trainium before? [flux_lora_handson_zh.md](flux_lora_handson_zh.md) walks
+through the whole thing in Chinese, from an empty machine to generated images.
+
 A runnable version of everything below is `examples/generate_flux_lora.py`:
 
 ```bash
@@ -123,15 +126,36 @@ The swap is expensive, and worth understanding before sizing a deployment. It
 rewrites the whole slot — 634 MB per core, 2.5 GB across four cores — as ~4300
 separate small copies, one per adapted module per rank. Two things follow:
 
-- **The cost scales with `max_lora_rank`, not with the adapter's own rank.** A
-  22 MB rank-16 adapter and a 585 MB rank-64 one swap in for the same 1.84 s,
-  because both are padded into a rank-64 slot and the whole slot is rewritten.
-  Declaring `max_lora_rank=16` when 16 is what the adapters use cuts both the
-  memory and the swap cost roughly fourfold.
-- **It is paid once per request, not once per denoising step.** It still is not
-  cheap: a 1024px 20-step generation takes 6.47 s on this setup, and the swap adds
-  1.89 s to it — about 30%. Raising `max_loras` so the hot adapters stay resident
-  removes it entirely, at 634 MB of HBM per core per slot.
+- **The cost follows `max_lora_rank`, not the adapter's own rank.** A 22 MB
+  rank-16 adapter and a 585 MB rank-64 one swap in for the same 1.84 s, because
+  both are padded into a rank-64 slot and the whole slot is rewritten. Lowering the
+  slot width helps, but less than the memory saving suggests — the same adapter,
+  with only the compiled slot width changed:
+
+  | `max_lora_rank` | memory per slot per core | swap |
+  |---|---|---|
+  | 16 | 158.5 MB | 940 ms |
+  | 32 | 317 MB | 1322 ms |
+  | 64 | 634 MB | 1754 ms |
+
+  Memory is exactly linear in the rank; the swap is not, because roughly 0.7 s of
+  it is the fixed cost of issuing ~4300 copies regardless of how big each one is.
+  So rank 16 instead of 64 buys 4× the memory but only ~1.9× the swap.
+- **It is paid once per request, not once per denoising step**, so its share of a
+  request falls as the request gets longer while its absolute cost stays put.
+  Full 1024px requests, medians, `max_loras=1` so a different adapter each request
+  always misses:
+
+  | steps | base model | adapter resident | adapter swapped in | swap | swap's share |
+  |---|---|---|---|---|---|
+  | 4 | 1.58 s | 1.57 s | 3.37 s | 1.80 s | 53% |
+  | 20 | 6.39 s | 6.38 s | 8.15 s | 1.77 s | 22% |
+  | 28 | 8.80 s | 8.81 s | 10.58 s | 1.77 s | 17% |
+
+  Note the second and third columns: an adapter that is already in a slot costs
+  nothing measurable against the base model, at any step count. Raising
+  `max_loras` so the hot adapters stay resident is therefore the whole
+  optimisation, at 634 MB of HBM per core per slot.
 
 Falling back to disk on top of that re-reads and re-shards the adapter, so keep
 `max_cpu_loras` large enough for the working set. Eviction is LRU by default
@@ -149,25 +173,35 @@ three slots' worth):
 WARNING The memory footprint for LoRA adapters on each Neuron core is 1902.375 MB
 ```
 
-It scales linearly with both `max_loras` and `max_lora_rank`, so a rank-16
-adapter declared at `max_lora_rank=16` costs a quarter of the above. The host
-tier costs the same per adapter, in host memory, times `tp_degree`.
+It is exactly linear in both `max_loras` and `max_lora_rank`: 158.5 MB per slot at
+rank 16, 317 MB at 32, 634 MB at 64. The host tier costs the same per adapter, in
+host memory, times `tp_degree`.
 
 ## Samples
 
-One compiled model, one prompt, one seed; `kohya` was added at runtime after the
-model was loaded. 1024px, 20 steps, FLUX.1-dev at TP=4, shown here at 512px.
+One compiled model, one seed per prompt, one device slot; `kohya` was added at
+runtime after the model was loaded, and every row swapped adapters through that one
+slot. 1024px, 20 steps, FLUX.1-dev at TP=4, shown here at 384px.
 
-| base model | XLabs realism | kohya super-realism |
-|---|---|---|
-| ![base](flux_lora_samples/base.png) | ![xlabs](flux_lora_samples/xlabs.png) | ![kohya](flux_lora_samples/kohya.png) |
+| | base model | [XLabs realism](https://huggingface.co/XLabs-AI/flux-RealismLora) (r=16) | [kohya super-realism](https://huggingface.co/strangerzonehf/Flux-Super-Realism-LoRA) (r=64) |
+|---|---|---|---|
+| *fisherman* | ![](flux_lora_samples/fisherman_base.png) | ![](flux_lora_samples/fisherman_xlabs.png) | ![](flux_lora_samples/fisherman_kohya.png) |
+| *cafe* | ![](flux_lora_samples/cafe_base.png) | ![](flux_lora_samples/cafe_xlabs.png) | ![](flux_lora_samples/cafe_kohya.png) |
+| *workshop* | ![](flux_lora_samples/workshop_base.png) | ![](flux_lora_samples/workshop_xlabs.png) | ![](flux_lora_samples/workshop_kohya.png) |
 
-> *a close-up portrait photograph of an elderly fisherman mending a net, weathered
-> hands, overcast harbour light*
+<sub>*fisherman*: a close-up portrait photograph of an elderly fisherman mending a
+net, weathered hands, overcast harbour light — *cafe*: a photograph of a woman
+reading a paperback in a busy cafe window, afternoon sun, shallow depth of field —
+*workshop*: a photograph of a cluttered watchmaker's workbench, brass tools and
+loupe, single desk lamp</sub>
 
-Generating the base image again after both adapters had been swapped through the
-device slot reproduced the first one byte for byte, as did generating with `kohya`
-a second time.
+Each adapter has a consistent effect across prompts, which is the point of the
+comparison: it is the adapter showing up, not prompt-to-prompt variation.
+
+The images are also reproducible across swaps. Generating the base image again
+after both adapters had passed through the device slot reproduced the first one
+byte for byte, as did re-running an adapter — including in a separate process with
+a different load and swap history.
 
 ## Accuracy
 
