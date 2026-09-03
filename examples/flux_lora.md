@@ -63,6 +63,12 @@ image = app(prompt="a portrait of a fisherman", num_inference_steps=20).images[0
 app.set_lora_adapters(None)        # back to the base model
 ```
 
+Every adapter declared here is resident on device, whether or not `max_loras` says so:
+`LoraServingConfig` raises `max_loras` to cover the declared checkpoints and logs
+`Setting the number of LoRA adapters in HBM to N`. So `max_loras` is a floor for
+declared adapters, not a cap — to serve more adapters than fit on device, declare the
+ones that fit and add the rest with `add_lora_adapter()`.
+
 Only the backbone is adapted. LoRA weights aimed at the text encoders are ignored
 with a warning; the CLIP and T5 graphs are unchanged.
 
@@ -128,16 +134,35 @@ not the cost of choosing between adapters. With `max_loras=2` and both declared 
 build time, alternating between them costs nothing either (same 256px backbone step,
 10 calls each):
 
-| `max_loras=2`, both adapters resident | median | min | max |
-|---|---|---|---|
-| same adapter every call | 74.6 ms | 68.8 | 75.4 |
-| alternating two adapters | 75.0 ms | 69.4 | 76.4 |
-| no adapter | 72.0 ms | 68.6 | 75.4 |
+| | `max_loras=2`, both resident | `max_loras=1`, one slot |
+|---|---|---|
+| repeating one adapter | 74.2 ms | 75.1 ms |
+| alternating two adapters | 73.1 ms | 1844.8 ms |
+| no adapter (slot 0) | 74.2 ms | 75.2 ms |
+| **alternating − repeating** | **−1.1 ms** | **+1769.8 ms** |
 
-Alternating costs **+0.4 ms per call** against repeating one adapter: switching between
-resident adapters is free in the same sense that a device hit is. (Having *any* adapter
-active shows up as ~2 ms here, which is inside the ~7 ms spread of all three rows and
-not resolvable at ten calls.)
+With both resident, the difference between alternating and repeating is about a
+millisecond on a 74 ms step and it changes sign between runs (a second run gave
++0.4 ms), which is what "free" looks like when it is measured rather than asserted: at
+ten calls per pattern there is nothing there to resolve. Whether *any* adapter is
+active is equally invisible (+0.1 ms here, −0.2 ms at `max_loras=1`). With one slot the
+same request pattern spends 1.77 s per call moving weights.
+
+Reproduce with:
+
+```bash
+python examples/benchmark_flux_lora.py \
+    -c /shared/flux/FLUX.1-dev/ --compile_workdir /tmp/flux-lora-2/ \
+    --lora xlabs=/adapters/xlabs-realism \
+    --lora kohya=/adapters/super-realism.safetensors \
+    --max-lora-rank 64
+```
+
+The same command with `--max-loras 1` (and its own `--compile_workdir`, since that
+changes the graph) measures the right-hand column: one device slot, so the alternating
+pattern has to swap every request. The script declares only the adapters that fit and
+adds the rest with `add_lora_adapter()`, because a declared adapter is always
+resident.
 
 So the 1.84 s swap is a configuration outcome, not a floor: raise `max_loras` until the
 hot adapters stay resident and per-request adapter selection disappears from the

@@ -170,21 +170,84 @@ kohya                      2.18 s
 2. **换入是每请求一次，不是每步一次**：绝对值恒定在 ~1.78 s，所以步数越多它占的
    比例越小。想彻底消掉它，就把 `max_loras` 调大让热点 LoRA 常驻。
 
-第 2 点不是推测，是量过的。把 `max_loras` 开到 2、两个 LoRA 都在构建时声明，于是两个
-都常驻设备，再用同样的交替请求模式（256px 单次 backbone 前向，各 10 次）：
+第 2 点不是推测，是量过的，而且你可以自己量一遍。
 
-| `max_loras=2`，两个都常驻 | 中位数 | min | max |
-|---|---|---|---|
-| 每次都用同一个 LoRA | 74.6 ms | 68.8 | 75.4 |
-| 两个 LoRA 交替 | 75.0 ms | 69.4 | 76.4 |
-| 不用 LoRA | 72.0 ms | 68.6 | 75.4 |
+### 自己量一遍：都常驻 vs 只有一个槽位
 
-**交替比重复只贵 +0.4 ms**——也就是说，在两个都常驻的 LoRA 之间来回切，和命中同一个
-LoRA 一样免费。（"用了 LoRA"本身在这里体现为约 2 ms，而三行的抖动范围都有 ~7 ms、
-互相重叠，10 次调用分辨不出来。）
+`benchmark_flux_lora.py` 就干这一件事：在同一个编译好的模型上比三种请求模式——**重复用
+同一个 LoRA**、**在多个 LoRA 之间交替**、**不用 LoRA**。前两者的差就是"换 LoRA"的代价，
+而它取决于你给了几个设备槽位。
 
-所以上面那 1.78 s 是**配置的结果，不是下限**：`max_loras` 开到装得下热点集合，按请求
-换 LoRA 就从延时里消失了，代价是每槽每核 634 MB 显存。
+**第一步：所有 LoRA 都常驻**（`--max-loras` 默认就是 LoRA 的个数）：
+
+```bash
+python examples/benchmark_flux_lora.py \
+    -c $CKPT --compile_workdir /tmp/flux-lora-2/ \
+    --lora xlabs=$HOME/loras/xlabs-realism \
+    --lora kohya=$HOME/loras/super-realism.safetensors \
+    --max-lora-rank 64
+```
+
+```
+WARNING The memory footprint for LoRA adapters on each Neuron core is 2536.5 MB
+max_loras=2, rank 64, 2 adapters: ['xlabs', 'kohya'] -- all resident
+
+=== 256px, one backbone step, TP=4, rank 64, max_loras=2 ===
+  repeating one adapter (xlabs)      median   74.2 ms  min   70.4  max   74.7
+  alternating 2 adapters             median   73.1 ms  min   69.5  max   74.7
+  no adapter (base model, slot 0)    median   74.2 ms  min   72.8  max   75.1
+
+  alternating vs repeating = -1.1 ms per call -- selection only, every adapter resident
+  any adapter vs the base model = +0.1 ms per call
+```
+
+**第二步：只留一个槽位**——同一条命令加 `--max-loras 1`，并且换一个
+`--compile_workdir`（槽位数变了，图也变了，必须重新编译）。注意脚本此时只把**第一个**
+LoRA 在构建时声明，第二个用 `add_lora_adapter()` 在运行时加进主机层：构建时声明的 LoRA
+是必然常驻的（`max_loras` 会被自动抬上去，见第 9 节），所以"槽位比 LoRA 少"只能这么表达：
+
+```bash
+python examples/benchmark_flux_lora.py \
+    -c $CKPT --compile_workdir /tmp/flux-lora-1/ \
+    --lora xlabs=$HOME/loras/xlabs-realism \
+    --lora kohya=$HOME/loras/super-realism.safetensors \
+    --max-lora-rank 64 --max-loras 1
+```
+
+```
+WARNING The memory footprint for LoRA adapters on each Neuron core is 1902.375 MB
+added kohya to the host tier in 1.09 s
+max_loras=1, rank 64, 2 adapters: ['xlabs', 'kohya'] -- 1 resident, 1 in host memory
+INFO Swap Adapter ID 2 to position 1 on device.
+
+=== 256px, one backbone step, TP=4, rank 64, max_loras=1 ===
+  repeating one adapter (xlabs)      median   75.1 ms  min   67.3  max 1900.1
+  alternating 2 adapters             median 1844.8 ms  min   75.7  max 1978.9
+  no adapter (base model, slot 0)    median   75.2 ms  min   74.4  max   77.6
+
+  alternating vs repeating = +1769.8 ms per call -- a host -> device swap
+  any adapter vs the base model = -0.2 ms per call
+```
+
+这次"交替"每次都要把另一个 LoRA 从主机搬进那唯一的槽位，多出来的 1.77 s 就是搬运。
+（`repeating` 那行的 max 1900.1 也是同一件事：预热之后第一次计时调用还得换一次。）
+
+### 两次测量放一起看
+
+| | 都常驻（`max_loras=2`） | 只有一个槽位（`max_loras=1`） |
+|---|---|---|
+| 重复同一个 LoRA | 74.2 ms | 75.1 ms |
+| 交替两个 LoRA | 73.1 ms | 1844.8 ms |
+| 不用 LoRA | 74.2 ms | 75.2 ms |
+| **交替 − 重复** | **−1.1 ms** | **+1769.8 ms** |
+
+左边那个差值大约 1 ms、在 74 ms 的一步上，而且换一次跑符号就反了（另一次跑是 +0.4 ms）
+——这就是"免费"被真的量出来的样子：10 次调用根本分辨不出来。"用了 LoRA"本身也一样看不
+出来（两次跑分别是 +0.1 ms 和 −0.2 ms）。而右边那一列，每个请求有 1.77 s 花在搬权重上。
+
+所以那 1.78 s 是**配置的结果，不是下限**：`max_loras` 开到装得下热点集合，按请求换 LoRA
+就从延时里消失了，代价是每槽每核 634 MB 显存（上面那行 2536.5 MB = 2 个 LoRA + base 槽
++ 1 份暂存缓冲 = 4 份）。
 
 ---
 
@@ -379,6 +442,13 @@ test/unit/models/flux/`）会把它清掉。同时跑多个任务时给每个设
 换入时主机缓冲和设备张量 dtype 不一致。原因是 FLUX 的线性层先按 fp32 建、之后整体
 cast 成 bf16，LoRA 层却记下了 fp32。这个已经在
 `lora.py::_align_lora_dtype` 修掉了；如果你还看到，说明代码不是最新的。
+
+**`max_loras` 设小了但没生效，显存占用还是按 LoRA 个数涨**
+构建时声明的 LoRA（`lora_ckpt_paths`）**必然常驻**：`LoraServingConfig._check_ckpt_config`
+会把 `max_loras` 抬到覆盖所有声明的 checkpoint，只在日志里留一行
+`Setting the number of LoRA adapters in HBM to N`。所以"槽位比 LoRA 少"这件事不能靠
+`max_loras` 一个参数表达，得**只声明装得下的那几个，其余用 `add_lora_adapter()` 在运行时加**
+（`benchmark_flux_lora.py` 的 `--max-loras` 就是这么处理的）。
 
 **HBM 不够（load 阶段 OOM）**
 每核预算约 22 GiB，要装下分片后的 backbone 加上 `(max_loras + 1) × 每槽显存`。

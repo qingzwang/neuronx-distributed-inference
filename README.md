@@ -7,6 +7,7 @@ This package includes examples that you can reference when you implement code th
 * `generation_demo.py` - A basic generation example for Llama.
 * `generate_flux.py` - Text-to-image generation with FLUX.
 * `generate_flux_lora.py` - FLUX with multiple LoRA adapters, including adapters loaded after the model is compiled and running. See [flux_lora.md](examples/flux_lora.md) for what it supports and what it costs, and [flux_lora_handson_zh.md](examples/flux_lora_handson_zh.md) for a step-by-step walkthrough in Chinese.
+* `benchmark_flux_lora.py` - What a FLUX LoRA costs per request: it times repeating one adapter, alternating several, and no adapter at all, so the cost of *not* having an adapter resident is measured rather than assumed. Run it once with every adapter resident and once with `--max-loras 1` to see both tiers; see [flux_lora.md](examples/flux_lora.md#what-a-lora-costs-at-request-time).
 
 One compiled FLUX model, one prompt, one seed, under the base model and two
 adapters — the second of which was loaded at runtime:
