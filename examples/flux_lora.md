@@ -115,12 +115,33 @@ step on FLUX.1-dev:
 
 | | cost | when |
 |---|---|---|
-| device hit | free — 75.7 ms/step against the base model's 74.1 ms, within the run-to-run spread of both | the adapter is already in a slot |
+| device hit | free — 75.7 ms/step against the base model's 74.1 ms, within the run-to-run spread of both | the adapter is already in a slot, whether or not the previous request used a different one |
 | host → device swap | **+1.84 s, once per request** | the adapter is in host memory but not in a slot |
 | disk → host | +1.1 s, once per adapter | `add_lora_adapter()`, or a request for an adapter the host tier has evicted |
 
 A device hit is genuinely free: the slot index is a graph input, so selecting an
 adapter costs nothing at all. Everything else is data movement.
+
+Those three tiers are measured at `max_loras=1`, where only one adapter can be on
+device at a time — so the swap row is the cost of an adapter *not being resident*,
+not the cost of choosing between adapters. With `max_loras=2` and both declared at
+build time, alternating between them costs nothing either (same 256px backbone step,
+10 calls each):
+
+| `max_loras=2`, both adapters resident | median | min | max |
+|---|---|---|---|
+| same adapter every call | 74.6 ms | 68.8 | 75.4 |
+| alternating two adapters | 75.0 ms | 69.4 | 76.4 |
+| no adapter | 72.0 ms | 68.6 | 75.4 |
+
+Alternating costs **+0.4 ms per call** against repeating one adapter: switching between
+resident adapters is free in the same sense that a device hit is. (Having *any* adapter
+active shows up as ~2 ms here, which is inside the ~7 ms spread of all three rows and
+not resolvable at ten calls.)
+
+So the 1.84 s swap is a configuration outcome, not a floor: raise `max_loras` until the
+hot adapters stay resident and per-request adapter selection disappears from the
+latency, at 634 MB per slot per core.
 
 The swap is expensive, and worth understanding before sizing a deployment. It
 rewrites the whole slot — 634 MB per core, 2.5 GB across four cores — as ~4300
