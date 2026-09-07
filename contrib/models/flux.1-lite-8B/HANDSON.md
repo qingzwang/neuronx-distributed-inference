@@ -94,6 +94,29 @@ aws-neuronx-tools 2.32.28.0-526c2b7f6
 export PATH=/opt/aws/neuron/bin:$PATH
 ```
 
+**版本和上面不一样、想对齐?** 用这个目录里的
+[`setup_neuron_system.sh`](setup_neuron_system.sh):
+
+```shell
+./contrib/models/flux.1-lite-8B/setup_neuron_system.sh --check   # 只报告差异，不改任何东西
+./contrib/models/flux.1-lite-8B/setup_neuron_system.sh           # 打印计划、确认后安装
+```
+
+它做四件事：比对这四个 apt 包、要换驱动时先确认没有进程占着 `/dev/neuron*`（有就拒绝，
+不去打断正在跑的任务）、安装（必要时降级）、重载内核模块并验证。目标版本写在脚本顶部，
+也可以用环境变量覆盖：`DKMS_VERSION=2.29.0.0 ./setup_neuron_system.sh`。
+
+三个容易踩的点：
+
+- **`runtime-lib` 和 `collectives` 必须同版本**（配套发布）。错配了只有在起张量并行时才报错，
+  单核跑完全看不出来。
+- **`dkms` 的版本号自成一套**（2.30.x vs 另外三个的 2.34.x/2.32.x），不要试图对齐。
+- **换过内核就要重装 `aws-neuronx-dkms`**，否则模块不会为新内核编译，`/dev/neuron0` 会消失。
+
+这是**系统层**，和 venv 无关——机器上所有 venv 共用同一个
+`/opt/aws/neuron/lib/libnrt.so.1`。Python 那一半见
+[`nxdi_requirements.txt`](nxdi_requirements.txt)。
+
 `sudo dmesg | grep -i neuron` 可以看驱动加载记录。注意这里也会混进**以前跑失败留下的
 运行时报错**，看到 ERROR 不要慌，先看时间戳是不是本次的。
 

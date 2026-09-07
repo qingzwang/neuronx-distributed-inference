@@ -54,8 +54,10 @@ from `setup.py` and breaks the preinstalled environment. `PYTHONPATH=<repo>/src`
 works too, per shell. Skipping this is what produces
 `ImportError: cannot import name 'create_flux_config'`.
 
-`nxdi_requirements.txt` next to this file is a `pip freeze` of the environment every
-number below was measured in, if you would rather pin than resolve (`pip install -r
+Two files next to this one pin the environment every number below was measured in:
+`setup_neuron_system.sh` for the apt layer (driver, runtime, collectives, tools —
+run it with `--check` first) and `nxdi_requirements.txt` for the Python layer, if you
+would rather pin than resolve (`pip install -r
 contrib/models/flux.1-lite-8B/nxdi_requirements.txt --extra-index-url
 https://pip.repos.neuron.amazonaws.com`). Otherwise:
 
