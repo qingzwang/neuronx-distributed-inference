@@ -54,6 +54,11 @@ from `setup.py` and breaks the preinstalled environment. `PYTHONPATH=<repo>/src`
 works too, per shell. Skipping this is what produces
 `ImportError: cannot import name 'create_flux_config'`.
 
+`nxdi_requirements.txt` next to this file is a `pip freeze` of the environment every
+number below was measured in, if you would rather pin than resolve (`pip install -r
+contrib/models/flux.1-lite-8B/nxdi_requirements.txt --extra-index-url
+https://pip.repos.neuron.amazonaws.com`). Otherwise:
+
 ```bash
 pip install "diffusers==0.32.0" accelerate   # the [flux] extra
 

@@ -175,6 +175,21 @@ pip install "diffusers==0.32.0" accelerate
 对应 `setup.py` 里的 `[flux]` extra。`diffusers` 要 **0.32.0**——FLUX 的
 pipeline / VAE / 调度器都从它来，版本对不上会在加载时报错。
 
+**想要完全一样的版本?** [`nxdi_requirements.txt`](nxdi_requirements.txt) 是本文这套环境的
+`pip freeze`,可以直接拿来建一个新 venv:
+
+```shell
+python3 -m venv ~/venv-nxdi-flux
+~/venv-nxdi-flux/bin/pip install -r contrib/models/flux.1-lite-8B/nxdi_requirements.txt \
+    --extra-index-url https://pip.repos.neuron.amazonaws.com
+# 然后照 B 那一步,让这个仓库成为被 import 的 NxDI
+~/venv-nxdi-flux/bin/pip install -e . --no-deps
+```
+
+里面最要紧的一行是 `neuronx-cc==2.26.6360.0`——2.27 编 FLUX 会崩(见第 9 节)。
+`neuronx-distributed-inference` 那一行是注释掉的:它就是这个仓库,靠上面的
+`pip install -e . --no-deps` 装,而不是让 pip 再 clone 一份。
+
 ### D. 验证环境通了
 
 ```shell
