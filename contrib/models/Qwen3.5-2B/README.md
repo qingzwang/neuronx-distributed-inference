@@ -21,6 +21,12 @@ installed NxDI library are required** — everything runs on the stock
 end-to-end on `trn2.48xlarge`. VL requires the legacy-direct DeltaNet CTE
 kernel — see the "Vision" section.
 
+> Reproducing this from scratch? [HANDSON.md](HANDSON.md) is a step-by-step Chinese
+> walkthrough — environment, checkpoint, text inference, TP selection, the Neuron
+> vision encoder, HF accuracy comparison, and the errors you will hit. It was run on
+> a **trn2.3xlarge at TP=4** (4 logical cores), so it also covers what changes on a
+> smaller instance than the trn2.48xlarge/TP=8 measured below.
+
 ## Contents
 
 ```
