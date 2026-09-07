@@ -126,17 +126,15 @@ aws_neuronx_venv_tensorflow_2_10
 
 ## 2. 准备 NxDI 环境
 
-### A. 激活环境并确认 NxDI 在
+### A. 激活环境
 
 ```shell
 source /opt/<VENV>/bin/activate          # 例：aws_neuronx_venv_pytorch_2_7_nxd_inference
-python -c "import neuronx_distributed_inference; print('已预装')"
 ```
 
-第一次 activate 可能比较慢，耐心等。如果报 `ModuleNotFoundError`，下一步克隆完仓库后
-在仓库根目录 `pip install -e .` 补上。
+第一次 activate 可能比较慢，耐心等。
 
-### B. 克隆仓库
+### B. 克隆仓库，并让**这个仓库的**代码生效
 
 ```shell
 cd ~
@@ -144,8 +142,28 @@ git clone https://github.com/qingzwang/neuronx-distributed-inference.git
 cd neuronx-distributed-inference
 git checkout model/flux1-lite-8B
 
-# 只有上一步 import 失败时才需要
-# pip install -e .
+# 这一步不能跳过
+pip install -e . --no-deps
+```
+
+**为什么不能跳过。** DLAMI 的 venv 里已经预装了一份 NxDI，而这个模型用到的
+`create_flux_config` 等 FLUX 接口在本仓库的 `src/` 里。不覆盖预装那份的话，
+`import neuronx_distributed_inference` 会成功（所以"import 通了"并不能说明环境对了），
+但真正跑起来会报：
+
+```
+ImportError: cannot import name 'create_flux_config' from
+'neuronx_distributed_inference.models.diffusers.flux.application'
+```
+
+`--no-deps` 是必须的：否则 pip 会按 `setup.py` 把 torch / torch-neuronx / neuronx-cc
+重装成别的版本，把预装环境弄坏（见 E）。
+
+不想装到环境里的话，也可以每次靠 `PYTHONPATH` 把仓库顶到前面——但要记得每个 shell
+都设一次：
+
+```shell
+export PYTHONPATH=$HOME/neuronx-distributed-inference/src:$PYTHONPATH
 ```
 
 ### C. 装 FLUX 的额外依赖
@@ -163,6 +181,11 @@ pipeline / VAE / 调度器都从它来，版本对不上会在加载时报错。
 cat > /tmp/verify_neuron.py << 'EOF'
 import torch, torch_neuronx, neuronx_distributed, neuronx_distributed_inference as nxdi
 import torch_xla.core.xla_model as xm
+
+# 这一行是 B 那一步到底生效没有的判据：FLUX 的接口只在本仓库的 src/ 里
+from neuronx_distributed_inference.models.diffusers.flux.application import (
+    create_flux_config,
+)
 
 print("torch:", torch.__version__, "| torch_neuronx:", torch_neuronx.__version__)
 print("nxdi:", nxdi.__file__)
@@ -195,6 +218,11 @@ UserWarning: Warning: Failed to import blockwise_mm_bwd: No module named
 ```
 
 MoE 专用的 NKI kernel，FLUX 用不到。
+
+**`nxdi:` 那一行必须是你 clone 出来的那个仓库的 `src/`。** 如果打印的是
+`/opt/aws_neuronx_venv_.../site-packages/neuronx_distributed_inference/__init__.py`，
+说明生效的还是预装那份，回到 B 重做——`create_flux_config` 那个 import 也会在这里
+先炸出来。
 
 ### E. 兜底：机器上没有 `_nxd_inference` 环境时
 
@@ -549,7 +577,8 @@ OOM，都可以先用它确认没有别的进程占着 core。
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| `[NCC_ISMP902] Simplifier error: is_subset()` | neuronx-cc 被解析到 2.27 | 降到 `2.26.6360.0`（第 2 节 B） |
+| `ImportError: cannot import name 'create_flux_config'` | 生效的是 DLAMI 预装的 NxDI，不是这个仓库 | `pip install -e . --no-deps`，或设 `PYTHONPATH=<repo>/src`（第 2 节 B）。用 `python -c "import neuronx_distributed_inference as n; print(n.__file__)"` 确认路径 |
+| `[NCC_ISMP902] Simplifier error: is_subset()` | neuronx-cc 被解析到 2.27 | 降到 `2.26.6360.0`（第 2 节 E） |
 | `collectives world size of 2 ... trying ... 4` | TP < 可见 core 数 | 设 `NEURON_RT_VISIBLE_CORES`（第 5 节） |
 | `nrt_tensor_allocate status=4` | 单 core HBM 不够 | 提高 TP；TP=1 装不下（第 5 节） |
 | `cores busy, ret=-16` | core 被别的进程占了 | `neuron-ls --wide` 找出来，或用 `NEURON_RT_VISIBLE_CORES` 错开 |

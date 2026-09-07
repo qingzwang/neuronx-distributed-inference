@@ -37,6 +37,23 @@ degrees that do.
 > environment check, install, download, first image, TP selection, monitoring,
 > and the errors you are likely to hit.
 
+This model calls FLUX interfaces that live in this repository's `src/`
+(`create_flux_config` and friends), so the import has to resolve here rather than to
+a preinstalled NxDI — on a DLAMI there is one, and it wins by default:
+
+```bash
+# in the activated Neuron venv, from the repository root
+pip install -e . --no-deps
+python -c "import neuronx_distributed_inference as n; print(n.__file__)"
+#   must print <this repo>/src/neuronx_distributed_inference/__init__.py, not
+#   /opt/aws_neuronx_venv_.../site-packages/...
+```
+
+`--no-deps` matters: without it pip reinstalls torch, torch-neuronx and neuronx-cc
+from `setup.py` and breaks the preinstalled environment. `PYTHONPATH=<repo>/src`
+works too, per shell. Skipping this is what produces
+`ImportError: cannot import name 'create_flux_config'`.
+
 ```bash
 pip install "diffusers==0.32.0" accelerate   # the [flux] extra
 
