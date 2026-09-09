@@ -22,6 +22,7 @@ tests, not a new model:
 | `src/flux_lite.py` | Checkpoint and TP-degree validation, config/application builder, per-stage latency measurement |
 | `src/generate.py` | CLI: generate images, sweep step counts, report where the time goes |
 | `test/integration/test_model.py` | Validation tests, plus accuracy against a CPU diffusers reference |
+| `gpu_reference/` | Stock diffusers on CUDA at the same settings, for the GPU-vs-Neuron comparison |
 | `samples/` | Outputs from trn2 at the settings documented below |
 | `HANDSON.md` | 中文上手实操文档：从登录机器到出图、看延时、看监控，逐步走一遍 |
 
@@ -288,6 +289,109 @@ during this work — the first attempt measured cos 0.816 and was wrong:
 Together they meant the two sides began from different latents. The tests build
 the initial latents once and pass them to both sides explicitly, and assert the
 reference's dtype after loading it.
+
+### Against stock diffusers on a GPU
+
+The comparison people actually make. Running unmodified `diffusers` on an H100 at
+these settings gives an image that is recognisably the same sample but differs in
+fine detail — same composition, pose, lighting and background, different paws,
+tail and whiskers:
+
+![Neuron TP=4 next to a GPU BF16 run of stock diffusers](samples/neuron_vs_gpu_bf16_28steps.png)
+
+*Left Neuron BF16 TP=4, right stock diffusers BF16 on one H100. Same prompt, seed,
+schedule and guidance; 21.9 dB apart, mean 11.8/255.*
+
+**The GPU BF16 run is the outlier, not Neuron.** Holding everything else fixed —
+same pipeline, same weights, and the same initial latents passed in explicitly so
+trap 2 above cannot apply — and changing only arithmetic precision:
+
+| | GPU fp32 | GPU fp16 | GPU BF16 | Neuron BF16 TP=4 |
+| --- | --- | --- | --- | --- |
+| GPU fp32 | — | 32.9 / 2.3 | 21.7 / 11.9 | **31.2 / 2.0** |
+| GPU fp16 | 32.9 / 2.3 | — | 21.6 / 12.2 | **33.8 / 2.2** |
+| GPU BF16 | 21.7 / 11.9 | 21.6 / 12.2 | — | 21.9 / 11.8 |
+| Neuron BF16 TP=4 | 31.2 / 2.0 | 33.8 / 2.2 | 21.9 / 11.8 | — |
+
+PSNR dB / mean absolute difference per 255, 28 steps, seed 42, guidance 3.5.
+Neuron clusters with fp32 and fp16 at about 2/255; GPU BF16 sits about 12/255 from
+all three of them, Neuron included:
+
+![GPU fp32, GPU fp16, Neuron TP=4 and GPU BF16 side by side](samples/precision_fp32_fp16_bf16_neuron.png)
+
+*Ordered by distance from the fp32 reference. The first three are hard to tell
+apart; the fourth has splayed paws, a wider head and a different tail.*
+
+This is the whole-image version of what the CPU table above measures per
+component: Trainium accumulates matmuls in fp32 while a GPU BF16 kernel
+accumulates in BF16, so **Neuron is closer to fp32 than GPU BF16 is**, by 9 dB.
+"Neuron differs from the GPU" is really "GPU BF16 differs from everything,
+including from a GPU fp32 run of the identical script".
+
+So to compare the two hardware paths, make the GPU side fp32 — or accept that two
+16-bit runs of a 28-step flow-matching schedule land ~12/255 apart and check
+composition rather than pixels. For scale, on the GPU alone, changing nothing but
+the SDPA attention backend moves the image 34-37 dB, and this README's own
+TP=2-vs-TP=4 figure is 35.2 dB. GPU runs are otherwise bitwise reproducible:
+two requests in one process, and two processes, were byte-identical.
+
+Three controls, because a 21.9 dB difference could also mean a mismatched setting:
+
+* Seed 42 is 21.9 dB from the Neuron sample while seeds 43 and 44 are 10.6 dB,
+  i.e. unrelated images — the runs really do start from the same noise.
+* A `torch.Generator("cuda")` instead of the CPU generator `src/generate.py` uses
+  gives initial latents at cos 0.00006 and an image 11.5 dB away. Any such
+  mismatch shows up as a *different* image, not a subtly different one.
+* The Neuron column comes from the committed `samples/` image rather than a fresh
+  trn2 run, because the CUDA machine this was measured on has no Neuron device, so
+  the whole table is computed at that sample's 576x576. Which resampling filter
+  matches the sizes moves every number by under 0.5 dB and changes no ranking.
+
+One thing this does **not** support: arguing a difference is benign by injecting
+noise of the measured per-step size. A perturbation matching the cos 0.99989 above
+moves the image only ~43 dB when redrawn each step, and ~36 dB with its direction
+frozen; reaching 22 dB by perturbing T5's padding needs an implausible T5
+cos 0.43. Real low-precision error is correlated with the signal and steers the
+trajectory, so injected noise of the same magnitude understates it by ~20 dB. Run
+the precisions against each other instead. `gpu_reference/perturb_reference.py`
+reproduces those numbers.
+
+### Reproducing the GPU side
+
+`gpu_reference/` runs stock `diffusers` on CUDA with no Neuron dependency, at this
+model's Neuron defaults. It is a separate environment from the Neuron one:
+
+```bash
+python3 -m venv venv   # anywhere outside this repo
+./venv/bin/pip install -r contrib/models/flux.1-lite-8B/gpu_reference/gpu_requirements.txt
+
+cd contrib/models/flux.1-lite-8B/gpu_reference
+CK=/path/to/flux.1-lite-8B
+
+# the Neuron settings: 1024x1024, guidance 3.5, seed 42 on a CPU generator, BF16
+python run_gpu_ref.py -c $CK --steps 4,8,28 --tag bf16
+
+# the precision table, all three runs from bit-identical initial latents
+L=gpu_ref_out/bf16_28steps_seed42_g3.5.npz
+for d in bf16 fp16 fp32; do
+    python run_gpu_ref.py -c $CK --dtype $d --latents-from $L --tag fix_$d
+done
+python compare_precision.py \
+    "GPU FP32=gpu_ref_out/fix_fp32_28steps_seed42_g3.5.npz" \
+    "GPU FP16=gpu_ref_out/fix_fp16_28steps_seed42_g3.5.npz" \
+    "GPU BF16=gpu_ref_out/fix_bf16_28steps_seed42_g3.5.npz" \
+    "Neuron BF16 TP=4=../samples/flux_lite_1024px_28steps_tp4.png"
+```
+
+`compare_precision.py` also prints the intermediate tensors — CLIP pooled, T5
+embedding, initial and final latents — which is how a difference gets attributed
+to a stage. Measured there: fp32 vs BF16 reaches T5 cos 0.99916 but final-latent
+cos 0.95376, i.e. the divergence is accumulated in the backbone over the schedule,
+not introduced by prompt encoding.
+
+For reference, the same runs on one H100 at 1024x1024 batch 1: BF16 190-215
+ms/step, fp16 218 ms/step, fp32 1470 ms/step — trn2 at TP=4 is 217 ms/step, within
+a few percent of one H100 BF16 on this model.
 
 ## Running the tests
 

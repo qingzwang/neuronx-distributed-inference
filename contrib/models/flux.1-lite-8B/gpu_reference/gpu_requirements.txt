@@ -1,0 +1,22 @@
+# Python layer for the GPU reference in this folder. No Neuron packages: these
+# scripts run stock diffusers on CUDA, to compare against the Neuron path.
+#
+# The diffusers/transformers/tokenizers versions match ../nxdi_requirements.txt,
+# so the two sides differ in hardware and precision rather than in library
+# version. torch is the CUDA build instead of torch-neuronx.
+#
+#   python3 -m venv venv && ./venv/bin/pip install -r gpu_requirements.txt
+#
+# Measured with these versions on 8x H100 (CUDA 13.2 driver, cu128 wheels).
+accelerate==1.14.0
+diffusers==0.32.0
+huggingface_hub==0.36.2
+numpy==2.5.3
+pillow==12.3.0
+protobuf==7.36.1
+safetensors==0.8.0
+sentencepiece==0.2.2
+tokenizers==0.22.2
+torch==2.9.1
+torchvision==0.24.1
+transformers==4.57.6

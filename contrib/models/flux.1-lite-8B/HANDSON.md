@@ -209,7 +209,7 @@ python3 -m venv ~/venv-nxdi-flux
 ~/venv-nxdi-flux/bin/pip install -e . --no-deps
 ```
 
-里面最要紧的一行是 `neuronx-cc==2.26.6360.0`——2.27 编 FLUX 会崩(见第 9 节)。
+里面最要紧的一行是 `neuronx-cc==2.26.6360.0`——2.27 编 FLUX 会崩(见第 10 节)。
 `neuronx-distributed-inference` 那一行是注释掉的:它就是这个仓库,靠上面的
 `pip install -e . --no-deps` 装,而不是让 pip 再 clone 一份。
 
@@ -518,7 +518,46 @@ python contrib/models/flux.1-lite-8B/src/generate.py \
 
 ---
 
-## 7. 跑测试
+## 7. 和 GPU 上出的图不一样
+
+最常见的一类疑问：参数完全一样，Neuron 出的图和同事在 GPU 上用 `diffusers`
+pipeline 出的图对不上——构图、姿态、光照、背景都一样，但爪子、尾巴、胡须这些细节不同。
+
+![左 Neuron TP=4，右 H100 上的 stock diffusers BF16](samples/neuron_vs_gpu_bf16_28steps.png)
+
+**这不是 Neuron 的问题，离群的是 GPU 上的 BF16。** 固定 pipeline、权重和初始
+latents，只改算术精度（28 步、seed 42、guidance 3.5，PSNR dB / 平均绝对差 per 255）：
+
+| | GPU fp32 | GPU fp16 | GPU BF16 | Neuron BF16 TP=4 |
+| --- | --- | --- | --- | --- |
+| GPU fp32 | — | 32.9 / 2.3 | 21.7 / 11.9 | **31.2 / 2.0** |
+| GPU fp16 | 32.9 / 2.3 | — | 21.6 / 12.2 | **33.8 / 2.2** |
+| GPU BF16 | 21.7 / 11.9 | 21.6 / 12.2 | — | 21.9 / 11.8 |
+| Neuron BF16 TP=4 | 31.2 / 2.0 | 33.8 / 2.2 | 21.9 / 11.8 | — |
+
+![GPU fp32 / GPU fp16 / Neuron TP=4 / GPU BF16](samples/precision_fp32_fp16_bf16_neuron.png)
+
+Neuron 和 fp32、fp16 挤在一起（约 2/255），GPU BF16 离这三者都有约 12/255。原因就是
+`README.md` 精度那节说的：Trainium 的 matmul 用 fp32 累加，而 GPU 的 BF16 kernel 用
+BF16 累加，所以 **Neuron 比 GPU BF16 更接近 fp32，差 9 dB**。"Neuron 和 GPU 不一样"
+其实是"GPU BF16 和所有东西都不一样，包括和同一个脚本的 GPU fp32"。
+
+怎么处理：
+
+* 要对比两边，GPU 侧用 **fp32**；或者接受两个 16 位实现跑 28 步会差约 12/255，
+  比构图而不是比像素。作为尺度参考：GPU 上只改 SDPA attention 后端，图就会差
+  34–37 dB，而本文 TP=2 vs TP=4 是 35.2 dB。
+* 对比时初始噪声必须**只抽一次再传给两边**。同一个 seed 在 fp32 和 BF16 下抽出的
+  不是同一组数四舍五入，而是完全不同的数（见 `README.md` 的"两个测量陷阱"）。
+* `torch.Generator("cuda")` 而不是 `src/generate.py` 用的 CPU generator，会直接换一
+  张图（initial latents cos 0.00006）。**差别很大**说明参数对不上，**差别细微**才是精度。
+
+GPU 侧的脚本在 `gpu_reference/`，不依赖 Neuron，单独建一个 venv 就能跑，命令见
+`README.md` 的 "Reproducing the GPU side"。
+
+---
+
+## 8. 跑测试
 
 ```shell
 cd ~/neuronx-distributed-inference
@@ -546,7 +585,7 @@ matmul 用 fp32 累加。所以"Neuron 和 CPU BF16 有差异"这件事，差异
 
 ---
 
-## 8. 监控
+## 9. 监控
 
 ### A. neuron-top —— 交互式实时监控
 
@@ -611,7 +650,7 @@ OOM，都可以先用它确认没有别的进程占着 core。
 
 ---
 
-## 9. 常见问题
+## 10. 常见问题
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
@@ -627,7 +666,7 @@ OOM，都可以先用它确认没有别的进程占着 core。
 
 ---
 
-## 10. 接下来
+## 11. 接下来
 
 - `README.md` —— 这个 contrib 模型的完整说明：精度数据、延时、兼容性矩阵
 - `src/flux_lite.py` —— 校验、配置构建、分阶段计时的实现

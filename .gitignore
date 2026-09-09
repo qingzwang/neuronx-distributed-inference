@@ -144,3 +144,6 @@ global_metric_store.json
 
 # Compiler artifacts
 neuronxcc*
+
+# GPU reference runs (contrib/models/flux.1-lite-8B/gpu_reference default out-dir)
+gpu_ref_out/
